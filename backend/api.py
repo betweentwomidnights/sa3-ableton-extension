@@ -26,6 +26,16 @@ from typing import Any
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - .env loading is a convenience
+    load_dotenv = None
+
+
+BASE_DIR = Path(__file__).resolve().parent
+if load_dotenv is not None:
+    load_dotenv(BASE_DIR / ".env", override=False)
+
 RUNTIME_IMPORT_ERRORS: dict[str, str] = {}
 
 try:
@@ -98,7 +108,6 @@ CONTINUE_TAIL_PAD = float(os.environ.get("SA3_CONTINUE_TAIL_PAD", "6.0"))
 CONTINUE_TAIL_PAD_MAX = float(os.environ.get("SA3_CONTINUE_TAIL_PAD_MAX", "60.0"))
 OUTPUT_SAMPLE_RATE = int(os.environ.get("SA3_SAMPLE_RATE", "44100"))
 
-BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR") or str(BASE_DIR / "outputs")
 PROMPTS_DIR = os.environ.get("SA3_PROMPTS_DIR") or str(BASE_DIR / "prompts")
 LORA_DIR = os.environ.get("SA3_LORA_DIR") or str(BASE_DIR / "loras")

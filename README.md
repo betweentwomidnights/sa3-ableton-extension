@@ -1,48 +1,52 @@
-# SA3 Ableton Extension
+# sa3 ableton extension
 
-Stable Audio 3 generation, transformation, and continuation directly inside Ableton Live arrangement selections.
+stable audio 3 generation, transformation, and continuation directly inside Ableton Live arrangement selections.
 
-This is an early V1 built against the Ableton Extensions SDK beta. The long-term idea is much larger: model workflows that feel native inside Live instead of forcing the user to leave the DAW, record into a plugin, drag files around, or manually line generated audio back up on the timeline. For now, this repo is intentionally focused on Stable Audio 3.
+fair warning...there's a bit of setup involved and you'll have to run at least one terminal while using the ableton beta (two terminals if you're not using gary4local)
 
-## What It Does
+2nd warning...untested on macOS. plz let me know if it works/doesn't work on apple silicon.
 
-The extension adds three right-click actions on audio-track arrangement selections:
+this is an early V1 built against the Ableton Extensions SDK beta. the long-term idea is much larger: model workflows that feel native inside Live instead of forcing the user to leave the DAW, record into a plugin, drag files around, or manually line generated audio back up on the timeline. for now, this repo is intentionally focused on stable audio 3.
+
+## what it do
+
+the extension adds three right-click actions on audio-track arrangement selections:
 
 - `Gary SA3: Transform Selection`
 - `Gary SA3: Continue Selection`
 - `Gary SA3: Generate Selection`
 
-Transform renders the selected audio range, sends it to an SA3 backend, and replaces the selected region by default.
+transform renders the selected audio range, sends it to an SA3 backend, and replaces the selected region by default.
 
-Continue renders the selected audio range, asks SA3 for a longer inpaint continuation, and replaces from the selection start with the returned source-plus-continuation clip.
+continue renders the selected audio range, asks SA3 for a longer inpaint continuation, and replaces from the selection start with the returned source-plus-continuation clip.
 
-Generate uses the selected arrangement duration to create audio from text and places the result at the selected start.
+generate uses the selected arrangement duration to create audio from text and places the result at the selected start.
 
-Live undo restores the previous timeline state, which makes the replace workflow feel surprisingly natural.
+ableton's undo restores the previous timeline state, which makes the replace workflow feel surprisingly natural.
 
-## Backend
+## backend
 
-This repo is local-first. The public branch defaults to:
+this repo is local-first. The public branch defaults to:
 
 ```text
 http://localhost:8006
 ```
 
-The dialog keeps an editable backend URL field, so you can point it at any compatible SA3 server you control.
+the dialog keeps an editable backend URL field, so you can point it at any compatible SA3 server you control.
 
-Tested today with the Gary4local companion app:
+tested today with the Gary4local companion app:
 
 https://github.com/betweentwomidnights/gary-localhost-installer
 
-The standalone backend in [backend/](backend/) was extracted from Gary4local's `services/sa3/api.py` so people can run a small API wrapper around their existing official Stable Audio 3 checkout. The goal is to stay as close as possible to upstream:
+the standalone backend in [backend/](backend/) was extracted from Gary4local's `services/sa3/api.py` so people can run a small API wrapper around their existing official Stable Audio 3 checkout. The goal is to stay as close as possible to upstream:
 
 https://github.com/Stability-AI/stable-audio-3
 
-If you do not have a suitable GPU and want hosted access, open an issue or reach out. We are thinking carefully about how to offer a remote option without accidentally melting our own hardware.
+if you do not have a suitable GPU and want hosted access, open an issue or reach out. you can use our remote backend if you ask nicely, and if you're clever enough, you'll figure out how gary4juce talks to it anyway.
 
-## Backend Contract
+## backend contract
 
-The extension expects an SA3-compatible HTTP backend with:
+the extension expects an SA3-compatible HTTP backend with:
 
 - `GET /health`
 - `GET /loras`
@@ -52,13 +56,15 @@ The extension expects an SA3-compatible HTTP backend with:
 - `POST /continue`
 - `GET /poll_status/<session_id>`
 
-The local backend also preserves useful output-shaping environment variables from Gary4local, including latent scaling, peak normalization, and a gentle limiter. See [PUBLIC_RELEASE_PLAN.md](PUBLIC_RELEASE_PLAN.md).
+the local backend also preserves useful output-shaping environment variables from gary4local, including latent scaling, peak normalization, and a gentle limiter. these handle some of the loudness issues i get from my loras. see [PUBLIC_RELEASE_PLAN.md](PUBLIC_RELEASE_PLAN.md).
 
-Backend extraction is now in [backend/](backend/). Start with [backend/README.md](backend/README.md).
+backend extraction is now in [backend/](backend/). start with [backend/README.md](backend/README.md); the local SA3 setup uses `uv` and installs the official upstream stable audio 3 repo into the backend venv.
 
-## Ableton Beta Sequence
+LoRA setup is documented in [backend/LORAS.md](backend/LORAS.md), including registry JSON, prompt dice files, and API checks.
 
-This sequence matters with the current Ableton Extensions SDK beta:
+## ableton beta sequence
+
+this sequence matters with the current Ableton Extensions SDK beta:
 
 1. Download the Ableton Live beta and Ableton Extensions SDK from:
    https://ableton.github.io/extensions-sdk/
@@ -74,11 +80,11 @@ This sequence matters with the current Ableton Extensions SDK beta:
 npm start
 ```
 
-In our Windows 11 beta testing, running `npm start` before Live had seen and installed the extension meant the context-menu entries did not appear. The reliable order was: install in Live, restart Live, then start the dev host from the terminal.
+in our Windows 11 beta testing, running `npm start` before Live had seen and installed the extension meant the context-menu entries did not appear. the reliable order was: install in Live (enable developer mode), restart Live, then start the dev host from the terminal.
 
-## Ableton SDK Setup
+## Ableton SDK setup
 
-This repo does not vendor Ableton's SDK packages.
+this repo does not vendor Ableton's SDK packages.
 
 1. Download the Ableton Extensions SDK beta from Ableton.
 2. Copy these tarballs into [vendor/](vendor/):
@@ -90,46 +96,46 @@ This repo does not vendor Ableton's SDK packages.
 npm install
 ```
 
-## Build
+## build
 
 ```shell
 npm run build
 ```
 
-Package an installable `.ablx`:
+package an installable `.ablx`:
 
 ```shell
 npm run package:ablx
 ```
 
-The package is written to `dist/gary-extension.ablx`.
+the package is written to `dist/gary-extension.ablx`.
 
-## Developer Host
+## developer host
 
-Run in Live developer mode with the Windows host bootstrap:
+run in Live developer mode with the Windows host bootstrap:
 
 ```shell
 npm start
 ```
 
-Create a local `.env` file from [.env.example](.env.example) that points `EXTENSION_HOST_PATH` at the Live install root, Ableton Live executable, ExtensionHost directory, or `ExtensionHostNodeModule.node`.
+create a local `.env` file from [.env.example](.env.example) that points `EXTENSION_HOST_PATH` at the Live install root, Ableton Live executable, ExtensionHost directory, or `ExtensionHostNodeModule.node`.
 
-For the most reliable tested Windows 11 Live 12 beta workflow:
+for the most reliable tested Windows 11 Live 12 beta workflow:
 
 1. Open Live first.
 2. Confirm Developer Mode is enabled in Preferences -> Extensions.
 3. Run `npm start`.
 
-The script relaunches itself with Ableton's bundled `Program\ExtensionHost\node.exe` before loading `ExtensionHostNodeModule.node`.
+the script relaunches itself with Ableton's bundled `Program\ExtensionHost\node.exe` before loading `ExtensionHostNodeModule.node`.
 
-The stock CLI path is still available:
+the stock CLI path is still available:
 
 ```shell
 npm run start:cli
 ```
 
-On the tested Windows setup, the custom `scripts/run-dev-host.cjs` path has been more reliable than `extensions-cli run`.
+on the tested Windows setup, the custom `scripts/run-dev-host.cjs` path has been more reliable than `extensions-cli run`.
 
 ## Status
 
-This is beta SDK exploration, not a polished product. Expect the repo shape, install flow, and backend wrapper to change quickly while we learn what Ableton Extensions can really do.
+this is beta SDK exploration, not a polished product. expect the repo shape, install flow, and backend wrapper to change quickly while we learn what Ableton Extensions can really do.

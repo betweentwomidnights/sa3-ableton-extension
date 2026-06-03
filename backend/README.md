@@ -43,22 +43,55 @@ python smoke-tests\health_smoke.py
 
 If `stable_audio_3`, `torch`, or `torchaudio` are not installed yet, `/health` will still respond and list missing packages under `runtime_import_errors`.
 
-## Full Stable Audio 3 Setup
+## Full Stable Audio 3 Setup With uv
 
-Follow the official Stable Audio 3 install guidance for your platform. For SA3 Medium on Windows/NVIDIA, the broad shape is:
+The official Stable Audio 3 repo uses `uv`, and this backend should too. The
+most direct path is to install the official repo into this backend's venv so
+`api.py` and `stable_audio_3` share one environment.
+
+Install `uv` first if you do not have it:
 
 ```shell
-cd path\to\stable-audio-3
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
-python -m pip install -e . --no-deps
-python -m pip install -r path\to\sa3-ableton-extension\backend\requirements.txt
-python -m pip install <matching-flash-attn-wheel>
-python -m pip install --force-reinstall --no-deps torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+winget install astral-sh.uv
 ```
 
-Use the CUDA/PyTorch/Flash Attention wheels that match your system. Official SA3 Medium requires Flash Attention.
+On Windows/NVIDIA, the fragile part is matching Python, Torch, CUDA, and Flash
+Attention. These commands use Python 3.11, Torch 2.7.1, CUDA 12.8 wheels, and a
+matching Windows Flash Attention wheel. Adjust `cu128` and the Flash Attention
+wheel if your system needs a different build.
+
+```shell
+cd C:\dev
+git clone https://github.com/Stability-AI/stable-audio-3.git
+
+cd C:\dev\gary-extension\backend
+uv venv .venv --python 3.11
+.\.venv\Scripts\activate
+
+uv pip install --torch-backend cu128 -e C:\dev\stable-audio-3 -r requirements.txt
+uv pip install https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.2/flash_attn-2.8.2+cu128torch2.7.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl
+uv pip install --reinstall --no-deps --torch-backend cu128 torch==2.7.1 torchaudio==2.7.1
+```
+
+`--torch-backend cu128` is the important part. It lets `uv` install the official
+Stable Audio 3 dependencies from upstream while still choosing the CUDA Torch
+wheel family. The final Torch reinstall is intentionally defensive: if anything
+touches Torch while installing the Flash Attention wheel, this puts the expected
+CUDA build back at the end.
+
+Sanity check the environment:
+
+```shell
+python -c "import torch, torchaudio, stable_audio_3; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'available', torch.cuda.is_available()); print('sa3', stable_audio_3.__file__)"
+```
+
+Official SA3 Medium requires Flash Attention. If the Flash Attention wheel fails,
+check that all of these match:
+
+- Python version, for example `cp311`
+- Torch version, for example `torch2.7.1`
+- CUDA wheel family, for example `cu128`
+- Windows architecture, usually `win_amd64`
 
 ## Hugging Face Access
 
@@ -90,7 +123,7 @@ By default the backend scans:
 backend/loras
 ```
 
-for `.ckpt` and `.safetensors` files. You can also point `SA3_LORA_REGISTRY` at a JSON registry. See [examples/lora_registry.example.json](examples/lora_registry.example.json).
+for `.ckpt` and `.safetensors` files. You can also point `SA3_LORA_REGISTRY` at a JSON registry. See [LORAS.md](LORAS.md) and [examples/lora_registry.example.json](examples/lora_registry.example.json).
 
 Prompt dice pools live in:
 

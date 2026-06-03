@@ -1,9 +1,8 @@
-# Minimal API wrapper dependencies.
+# Small HTTP wrapper dependencies.
 #
-# Install the official Stable Audio 3 package separately so you can choose the
-# right torch/CUDA/Flash Attention path for your machine.
+# Stable Audio 3 itself should be installed from the official upstream repo with
+# uv so its own pyproject.toml remains the source of truth for model deps.
 flask>=3.0
 flask-cors>=6.0
+python-dotenv>=1.0
 soundfile>=0.13.1
-einops>=0.8.2
-huggingface-hub>=1.7.1

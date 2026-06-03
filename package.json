@@ -11,10 +11,10 @@
     "start:cli": "npm run build && extensions-cli run --inspect"
   },
   "dependencies": {
-    "@ableton-extensions/sdk": "file:C:/Users/thegr/Documents/extensions-sdk-1.0.0-beta.0/ableton-extensions-sdk-1.0.0-beta.0.tgz"
+    "@ableton-extensions/sdk": "file:vendor/ableton-extensions-sdk-1.0.0-beta.0.tgz"
   },
   "devDependencies": {
-    "@ableton-extensions/cli": "file:C:/Users/thegr/Documents/extensions-sdk-1.0.0-beta.0/ableton-extensions-cli-1.0.0-beta.0.tgz",
+    "@ableton-extensions/cli": "file:vendor/ableton-extensions-cli-1.0.0-beta.0.tgz",
     "@types/node": "^25.0.10",
     "esbuild": "0.28.0",
     "tsx": "^4.19.0",

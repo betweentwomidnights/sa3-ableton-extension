@@ -7,7 +7,6 @@
   <script>
     const initial = __INITIAL_JSON__;
     let availableLoras = initial.availableLoras || [];
-    const remoteBackendUrl = initial.remoteBackendUrl;
     const localBackendUrl = initial.localBackendUrl;
     const isWebKitMessageHandlerAvailable = window.webkit &&
       window.webkit.messageHandlers &&
@@ -91,23 +90,19 @@
       if (current === normalizeUrl(localBackendUrl)) {
         return "local";
       }
-      if (current === normalizeUrl(remoteBackendUrl)) {
-        return "remote";
-      }
       return "custom";
     }
 
     function updateBackendModeUi() {
       const mode = backendMode();
-      el("backendToggle").textContent = mode === "local" ? "local" : mode === "remote" ? "remote" : "custom";
+      el("backendToggle").textContent = mode === "local" ? "local" : "custom";
       el("backendToggle").title = mode === "local"
-        ? "using localhost SA3 backend - click for remote"
-        : "using remote SA3 backend - click for localhost";
+        ? "using localhost SA3 backend"
+        : "reset to localhost SA3 backend";
     }
 
-    function toggleBackend() {
-      const mode = backendMode();
-      el("backendUrl").value = mode === "local" ? remoteBackendUrl : localBackendUrl;
+    function resetBackendToLocal() {
+      el("backendUrl").value = localBackendUrl;
       updateBackendModeUi();
       setHealth("checking...", "pending");
       void checkBackendHealth();
@@ -373,7 +368,7 @@
       el("strength").addEventListener("input", (event) => {
         el("strengthValue").textContent = Number(event.target.value).toFixed(2);
       });
-      el("backendToggle").addEventListener("click", toggleBackend);
+      el("backendToggle").addEventListener("click", resetBackendToLocal);
       el("backendUrl").addEventListener("change", () => {
         updateBackendModeUi();
         void checkBackendHealth();
@@ -695,7 +690,7 @@
       <label class="full">
         backend
         <div class="backend-row">
-          <button id="backendToggle" type="button">remote</button>
+          <button id="backendToggle" type="button">local</button>
           <input id="backendUrl" type="text" spellcheck="false">
           <button id="healthCheck" type="button">check</button>
           <div class="health-status" id="healthStatus"></div>

@@ -6,3 +6,4 @@ dist/
 *.log
 *-stdout.txt
 *-stderr.txt
+vendor/*.tgz

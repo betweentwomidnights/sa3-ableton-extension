@@ -19,7 +19,6 @@ const API_VERSION = "1.0.0";
 const COMMAND_TRANSFORM_SELECTION = "gary.sa3.transformSelection";
 const COMMAND_CONTINUE_SELECTION = "gary.sa3.continueSelection";
 const COMMAND_GENERATE_SELECTION = "gary.sa3.generateSelection";
-const DEFAULT_REMOTE_SA3_URL = "https://g4l.thecollabagepatch.com/sa3";
 const DEFAULT_LOCAL_SA3_URL = "http://localhost:8006";
 
 type Context = ExtensionContext<typeof API_VERSION>;
@@ -58,7 +57,6 @@ interface DialogInitial extends TransformSettings {
   beatsPerBar: number;
   tempoLabel: string;
   keyScaleLabel: string;
-  remoteBackendUrl: string;
   localBackendUrl: string;
   availableLoras: string[];
   statusMessage: string;
@@ -98,7 +96,7 @@ interface TransformResult {
 }
 
 const defaultSettings: TransformSettings = {
-  backendUrl: DEFAULT_REMOTE_SA3_URL,
+  backendUrl: DEFAULT_LOCAL_SA3_URL,
   prompt: "",
   strength: 0.9,
   steps: 8,
@@ -354,7 +352,6 @@ async function runTransformDialog(
       beatsPerBar: initial.musicContext.beatsPerBar,
       tempoLabel: `${Math.round(initial.musicContext.tempo)} bpm`,
       keyScaleLabel: initial.musicContext.keyScale || "scale off",
-      remoteBackendUrl: DEFAULT_REMOTE_SA3_URL,
       localBackendUrl: DEFAULT_LOCAL_SA3_URL,
       availableLoras: mergeLoraNames(loraNames, settings.loras.map((lora) => lora.name)),
       statusMessage,
@@ -712,7 +709,7 @@ async function handleDialogRequest(
   }
 
   if (route.path === "/api/prompts") {
-    const backendUrl = route.query.backendUrl || DEFAULT_REMOTE_SA3_URL;
+    const backendUrl = route.query.backendUrl || DEFAULT_LOCAL_SA3_URL;
     const loras = route.query.lora
       ? route.query.lora.split(",").map((name) => name.trim()).filter(Boolean)
       : [];
@@ -722,7 +719,7 @@ async function handleDialogRequest(
   }
 
   if (route.path === "/api/loras") {
-    const backendUrl = route.query.backendUrl || DEFAULT_REMOTE_SA3_URL;
+    const backendUrl = route.query.backendUrl || DEFAULT_LOCAL_SA3_URL;
     const loras = await fetchAvailableLoras(backendUrl);
     sendJson(response, 200, {
       success: true,
@@ -733,7 +730,7 @@ async function handleDialogRequest(
   }
 
   if (route.path === "/api/health") {
-    const backendUrl = route.query.backendUrl || DEFAULT_REMOTE_SA3_URL;
+    const backendUrl = route.query.backendUrl || DEFAULT_LOCAL_SA3_URL;
     const health = await checkBackendHealth(backendUrl);
     sendJson(response, 200, { success: true, ...health });
     return;
@@ -802,7 +799,7 @@ async function fetchDicePrompt(
 function sanitizeSettings(settings: TransformSettings): TransformSettings {
   const seed = Number.isFinite(Number(settings.seed)) ? Math.trunc(Number(settings.seed)) : -1;
   return {
-    backendUrl: normalizeBaseUrl(settings.backendUrl || DEFAULT_REMOTE_SA3_URL),
+    backendUrl: normalizeBaseUrl(settings.backendUrl || DEFAULT_LOCAL_SA3_URL),
     prompt: settings.prompt.trim(),
     strength: clamp(Number(settings.strength), 0.01, 1.0),
     steps: Math.round(clamp(Number(settings.steps), 4, 16)),
@@ -1010,7 +1007,7 @@ function formatBeatBarDuration(beats: number, beatsPerBar: number): string {
 }
 
 function normalizeBaseUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "") || DEFAULT_REMOTE_SA3_URL;
+  return url.trim().replace(/\/+$/, "") || DEFAULT_LOCAL_SA3_URL;
 }
 
 function appendQuery(url: string, params: Record<string, string>): string {

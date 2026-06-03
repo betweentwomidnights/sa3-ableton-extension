@@ -17,7 +17,7 @@
 - The local SDK types do not appear to expose Live's time signature/meter yet, even though key/scale is exposed. This is useful beta feedback because bar-based UX currently has to assume 4 beats per bar.
 - The seed UX mirrors the JUCE SA3 tab: the last returned seed is displayed, but the transform request sends `-1` unless the user enables the seed checkbox.
 - The dialog is served from a short-lived localhost bridge in the extension host. Dice and LoRA refresh call same-origin bridge endpoints, which proxy `/prompts` and `/loras` through the host and avoid WebView CORS/reopen churn.
-- The SA3 dialog mirrors the `gary4juce` backend toggle: remote uses `https://g4l.thecollabagepatch.com/sa3`, local uses `http://localhost:8006`, and health probes `/health` through the localhost bridge.
+- The public SA3 dialog defaults to `http://localhost:8006` and keeps an editable backend URL field for custom local or user-controlled servers. Health probes `/health` through the localhost bridge.
 - V1 should stay SA3-focused. Other transform-capable models can become tabs later, but SA3 already proves the right-click selected-audio UX.
 - SA3 Continue is now a separate context-menu action. It sends the selected audio to `/continue`, asks for a continuation `duration (bars)`, and places the returned source-plus-tail audio as one longer replacement clip starting at the selection start.
 
@@ -33,7 +33,7 @@
 
 ## Suggested next steps
 
-- Test the prototype inside Live developer mode with remote SA3 first, then localhost `http://localhost:8006`.
+- Test the prototype inside Live developer mode against localhost `http://localhost:8006`.
 - Confirm whether `renderPreFxAudio` produces exactly the audio semantics we want for multi-track selections.
 - Test the separate `Gary SA3: Continue Selection` action using `/sa3/continue`.
 - Test the separate `Gary SA3: Generate Selection` action on empty audio-track arrangement ranges.

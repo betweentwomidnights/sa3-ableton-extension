@@ -136,6 +136,6 @@ npm run start:cli
 
 on the tested Windows setup, the custom `scripts/run-dev-host.cjs` path has been more reliable than `extensions-cli run`.
 
-## Status
+## status
 
 this is beta SDK exploration, not a polished product. expect the repo shape, install flow, and backend wrapper to change quickly while we learn what Ableton Extensions can really do.

@@ -7,8 +7,10 @@
   "scripts": {
     "build": "tsc --noEmit && tsx build.ts",
     "package:ablx": "npm run build && extensions-cli package -o dist/gary-extension.ablx",
-    "start": "npm run build && node scripts/run-dev-host.cjs",
-    "start:cli": "npm run build && extensions-cli run --inspect"
+    "start": "npm run start:cli",
+    "start:cli": "npm run build && extensions-cli run",
+    "start:debug": "npm run build && extensions-cli run --inspect",
+    "start:win": "npm run build && node scripts/run-dev-host.cjs"
   },
   "dependencies": {
     "@ableton-extensions/sdk": "file:vendor/ableton-extensions-sdk-1.0.0-beta.0.tgz"

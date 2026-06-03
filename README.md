@@ -112,7 +112,7 @@ the package is written to `dist/gary-extension.ablx`.
 
 ## developer host
 
-run in Live developer mode with the Windows host bootstrap:
+run in Live developer mode:
 
 ```shell
 npm start
@@ -126,15 +126,42 @@ for the most reliable tested Windows 11 Live 12 beta workflow:
 2. Confirm Developer Mode is enabled in Preferences -> Extensions.
 3. Run `npm start`.
 
-the script relaunches itself with Ableton's bundled `Program\ExtensionHost\node.exe` before loading `ExtensionHostNodeModule.node`.
+this uses Ableton's stock `extensions-cli run` path.
 
-the stock CLI path is still available:
+the explicit stock CLI path is also available:
 
 ```shell
 npm run start:cli
 ```
 
-on the tested Windows setup, the custom `scripts/run-dev-host.cjs` path has been more reliable than `extensions-cli run`.
+the Windows bootstrap we used during early testing is available as:
+
+```shell
+npm run start:win
+```
+
+on the tested Windows setup, the custom `scripts/run-dev-host.cjs` path has been more reliable than `extensions-cli run`. it relaunches itself with Ableton's bundled `Program\ExtensionHost\node.exe` before loading `ExtensionHostNodeModule.node`.
+
+on macOS, if you want to pass Live's `.app` path directly:
+
+```shell
+npm run start:cli -- --live "/Applications/Ableton Live 12 Beta.app"
+```
+
+avoid `--inspect` unless you are attaching a debugger. in this SDK beta, `--inspect` uses a break-on-start debugging mode, so the Extension Host can print `Started: Extension Host` while the extension code itself is still paused. if the extension activates, Ableton's Extension Host log should include lines like:
+
+```text
+[gary-sa3] activate
+[gary-sa3] registered context menu
+```
+
+on macOS, the Extension Host log lives under:
+
+```text
+~/Library/Preferences/Ableton/Live x.x.x/ExtensionHost.txt
+```
+
+if Live is running, developer mode is enabled, and the host is started but those `gary-sa3` log lines never appear, the extension entrypoint is not activating yet. if the log lines do appear but the menu is missing, make sure you are selecting an arrangement time range on an audio track and right-clicking that selected arrangement area.
 
 ## status
 

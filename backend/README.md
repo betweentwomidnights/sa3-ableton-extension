@@ -137,6 +137,8 @@ To build a prompt dice pool from LoRA caption sidecars:
 python build_lora_prompts.py --name my-sa3-lora --captions-dir C:\path\to\captions --out-dir prompts
 ```
 
+recommended LoRA training repo: https://github.com/dada-bots/underfit
+
 ## Output Shaping
 
 The wrapper includes local output-shaping controls that are not part of official upstream SA3. They are useful for DAW workflows, especially hot LoRA outputs:

@@ -56,7 +56,7 @@ the extension expects an SA3-compatible HTTP backend with:
 - `POST /continue`
 - `GET /poll_status/<session_id>`
 
-the local backend also preserves useful output-shaping environment variables from gary4local, including latent scaling, peak normalization, and a gentle limiter. these handle some of the loudness issues i get from my loras. see [PUBLIC_RELEASE_PLAN.md](PUBLIC_RELEASE_PLAN.md).
+the local backend also preserves useful output-shaping environment variables from gary4local, including latent scaling, peak normalization, and a gentle limiter. these handle some of the loudness issues i get from my loras.
 
 backend extraction is now in [backend/](backend/). start with [backend/README.md](backend/README.md); the local SA3 setup uses `uv` and installs the official upstream stable audio 3 repo into the backend venv.
 

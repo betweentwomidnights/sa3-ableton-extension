@@ -6,6 +6,7 @@ dist/
 *.log
 *-stdout.txt
 *-stderr.txt
+PUBLIC_RELEASE_PLAN.md
 vendor/*.tgz
 backend/outputs/
 backend/loras/

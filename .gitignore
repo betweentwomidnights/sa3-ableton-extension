@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.ableton-storage/
+.ableton-temp/
+*.log
+*-stdout.txt
+*-stderr.txt

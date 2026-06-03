@@ -1,0 +1,23 @@
+{
+  "name": "gary-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/extension.js",
+  "scripts": {
+    "build": "tsc --noEmit && tsx build.ts",
+    "package:ablx": "npm run build && extensions-cli package -o dist/gary-extension.ablx",
+    "start": "npm run build && node scripts/run-dev-host.cjs",
+    "start:cli": "npm run build && extensions-cli run --inspect"
+  },
+  "dependencies": {
+    "@ableton-extensions/sdk": "file:C:/Users/thegr/Documents/extensions-sdk-1.0.0-beta.0/ableton-extensions-sdk-1.0.0-beta.0.tgz"
+  },
+  "devDependencies": {
+    "@ableton-extensions/cli": "file:C:/Users/thegr/Documents/extensions-sdk-1.0.0-beta.0/ableton-extensions-cli-1.0.0-beta.0.tgz",
+    "@types/node": "^25.0.10",
+    "esbuild": "0.28.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3"
+  }
+}

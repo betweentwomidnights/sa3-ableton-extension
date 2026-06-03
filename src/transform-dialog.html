@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gary SA3</title>
+  <script>
+    const initial = __INITIAL_JSON__;
+    let availableLoras = initial.availableLoras || [];
+    const remoteBackendUrl = initial.remoteBackendUrl;
+    const localBackendUrl = initial.localBackendUrl;
+    const isWebKitMessageHandlerAvailable = window.webkit &&
+      window.webkit.messageHandlers &&
+      window.webkit.messageHandlers.live;
+    const isWebView2 = window.chrome && window.chrome.webview;
+
+    function sendMessage(message) {
+      if (isWebKitMessageHandlerAvailable) {
+        window.webkit.messageHandlers.live.postMessage(message);
+      } else if (isWebView2) {
+        window.chrome.webview.postMessage(message);
+      }
+    }
+
+    function closeWithResult(result) {
+      sendMessage({ method: "close_and_send", params: [JSON.stringify(result)] });
+    }
+
+    function el(id) {
+      return document.getElementById(id);
+    }
+
+    function value(id) {
+      return el(id).value.trim();
+    }
+
+    function checked(id) {
+      return el(id).checked;
+    }
+
+    function readSettings() {
+      const continueBars = Number(value("continueBars"));
+      return {
+        backendUrl: value("backendUrl"),
+        prompt: value("prompt"),
+        strength: Number(value("strength")),
+        steps: Number(value("steps")),
+        cfgScale: Number(value("cfgScale")),
+        shift: value("shift"),
+        negativePrompt: value("negativePrompt"),
+        seed: value("seed") ? Number(value("seed")) : -1,
+        useSeed: checked("useSeed"),
+        lastSeed: initial.lastSeed || "",
+        replaceSelection: checked("replaceSelection"),
+        continueBeats: continueBarsToBeats(continueBars),
+        loras: readLoras()
+      };
+    }
+
+    function readLoras() {
+      if (!checked("useLoras")) {
+        return [];
+      }
+
+      return Array.from(document.querySelectorAll(".lora-slider"))
+        .map((slider) => ({
+          name: slider.dataset.name,
+          strength: Number(slider.value)
+        }))
+        .filter((lora) => lora.name && lora.strength > 0);
+    }
+
+    function closeWithAction(action) {
+      closeWithResult({ action, settings: readSettings() });
+    }
+
+    function setStatus(text) {
+      el("loraStatus").textContent = text || "";
+    }
+
+    function activeLoraNames() {
+      return readLoras().map((lora) => lora.name).filter(Boolean);
+    }
+
+    function normalizeUrl(url) {
+      return String(url || "").trim().replace(/\/+$/, "");
+    }
+
+    function backendMode() {
+      const current = normalizeUrl(value("backendUrl"));
+      if (current === normalizeUrl(localBackendUrl)) {
+        return "local";
+      }
+      if (current === normalizeUrl(remoteBackendUrl)) {
+        return "remote";
+      }
+      return "custom";
+    }
+
+    function updateBackendModeUi() {
+      const mode = backendMode();
+      el("backendToggle").textContent = mode === "local" ? "local" : mode === "remote" ? "remote" : "custom";
+      el("backendToggle").title = mode === "local"
+        ? "using localhost SA3 backend - click for remote"
+        : "using remote SA3 backend - click for localhost";
+    }
+
+    function toggleBackend() {
+      const mode = backendMode();
+      el("backendUrl").value = mode === "local" ? remoteBackendUrl : localBackendUrl;
+      updateBackendModeUi();
+      setHealth("checking...", "pending");
+      void checkBackendHealth();
+      void refreshLorasInPlace();
+    }
+
+    function setHealth(text, state) {
+      const node = el("healthStatus");
+      node.textContent = text;
+      node.dataset.state = state || "";
+    }
+
+    async function fetchJsonWithTimeout(url, timeoutMs) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const response = await fetch(url, {
+          method: "GET",
+          signal: controller.signal,
+          headers: { "Accept": "application/json" }
+        });
+        const text = await response.text();
+        const json = text.trim() ? JSON.parse(text) : {};
+        if (!response.ok) {
+          throw new Error(errorFromResponse(json, `HTTP ${response.status}`));
+        }
+        return json;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    async function rollDiceInPlace() {
+      const button = el("diceButton");
+      button.disabled = true;
+      setStatus(readLoras().length > 0 ? "rolling lora prompt..." : "rolling prompt...");
+
+      try {
+        const loras = activeLoraNames();
+        const url = appendQuery("/api/prompts", {
+          backendUrl: value("backendUrl"),
+          ...(loras.length > 0 ? { lora: loras.join(",") } : {})
+        });
+
+        const json = await fetchJsonWithTimeout(url, 15000);
+        if (!json.success || !json.prompt) {
+          throw new Error(errorFromResponse(json, "failed to roll prompt"));
+        }
+        const missingLoras = Array.isArray(json.missingLoras) ? json.missingLoras : [];
+        el("prompt").value = json.prompt;
+        setStatus(missingLoras.length > 0
+          ? `rolled prompt; missing ${missingLoras.length} lora pool${missingLoras.length === 1 ? "" : "s"}`
+          : loras.length > 0 ? "rolled lora prompt" : "rolled prompt");
+      } catch (error) {
+        setStatus("rolling via extension host...");
+        closeWithAction("dice");
+        return;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function appendQuery(url, params) {
+      const entries = Object.entries(params).filter((entry) => String(entry[1]).trim());
+      if (entries.length === 0) {
+        return url;
+      }
+
+      const query = entries
+        .map((entry) => `${encodeURIComponent(entry[0])}=${encodeURIComponent(entry[1])}`)
+        .join("&");
+      return `${url}${url.indexOf("?") === -1 ? "?" : "&"}${query}`;
+    }
+
+    function errorFromResponse(response, fallback) {
+      if (response && typeof response === "object") {
+        for (const key of ["detail", "error", "message"]) {
+          const value = response[key];
+          if (typeof value === "string" && value.trim()) {
+            return value.trim();
+          }
+        }
+        if (Array.isArray(response.errors) && response.errors.length > 0) {
+          return response.errors.map(String).join(", ");
+        }
+      }
+
+      return fallback;
+    }
+
+    function renderLoras() {
+      const active = currentLoraStrengths();
+      const names = availableLoras;
+      const rows = el("loraRows");
+      rows.replaceChildren();
+
+      el("useLoras").disabled = names.length === 0;
+      el("useLoras").checked = names.some((name) => (active.get(name) || 0) > 0);
+      el("advanced").open = el("useLoras").checked;
+
+      if (names.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "muted full";
+        empty.textContent = "none";
+        rows.append(empty);
+        return;
+      }
+
+      for (const name of names) {
+        const row = document.createElement("div");
+        row.className = "lora-row";
+
+        const label = document.createElement("div");
+        label.className = "lora-name";
+        label.textContent = name;
+        label.title = name;
+
+        const slider = document.createElement("input");
+        slider.className = "lora-slider";
+        slider.type = "range";
+        slider.min = "0";
+        slider.max = "2";
+        slider.step = "0.01";
+        slider.value = String(active.get(name) || 0);
+        slider.dataset.name = name;
+
+        const amount = document.createElement("span");
+        amount.className = "lora-value";
+        amount.textContent = Number(slider.value).toFixed(2);
+
+        slider.addEventListener("input", () => {
+          amount.textContent = Number(slider.value).toFixed(2);
+          if (Number(slider.value) > 0) {
+            el("useLoras").checked = true;
+          }
+        });
+
+        row.append(label, slider, amount);
+        rows.append(row);
+      }
+
+      updateLoraVisibility();
+    }
+
+    function currentLoraStrengths() {
+      const sliders = Array.from(document.querySelectorAll(".lora-slider"));
+      if (sliders.length > 0) {
+        return new Map(sliders.map((slider) => [slider.dataset.name, Number(slider.value)]));
+      }
+
+      return new Map((initial.loras || []).map((lora) => [lora.name, Number(lora.strength)]));
+    }
+
+    function updateLoraVisibility() {
+      const enabled = checked("useLoras");
+      el("loraRows").classList.toggle("disabled", !enabled);
+    }
+
+    async function refreshLorasInPlace() {
+      const button = el("refreshLoras");
+      button.disabled = true;
+      setStatus("refreshing loras...");
+
+      try {
+        const json = await fetchJsonWithTimeout(appendQuery("/api/loras", {
+          backendUrl: value("backendUrl")
+        }), 8000);
+        if (!json.success || !Array.isArray(json.loras)) {
+          throw new Error(errorFromResponse(json, "failed to refresh loras"));
+        }
+
+        availableLoras = json.loras;
+        setStatus(json.statusMessage || "");
+        renderLoras();
+      } catch (error) {
+        setStatus("refreshing via extension host...");
+        closeWithAction("refresh-loras");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function checkBackendHealth() {
+      try {
+        const json = await fetchJsonWithTimeout(appendQuery("/api/health", {
+          backendUrl: value("backendUrl")
+        }), 3000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, "health check failed"));
+        }
+
+        setHealth(json.online ? `online: ${json.status || "ok"}` : `offline: ${json.status || "failed"}`, json.online ? "online" : "offline");
+      } catch (error) {
+        setHealth("offline", "offline");
+      }
+    }
+
+    function updateSeedEnabled() {
+      const enabled = checked("useSeed");
+      el("seed").disabled = !enabled;
+      el("seed").classList.toggle("disabled", !enabled);
+    }
+
+    function operation() {
+      if (initial.operation === "continue") return "continue";
+      if (initial.operation === "generate") return "generate";
+      return "transform";
+    }
+
+    function beatsPerBar() {
+      return Number(initial.beatsPerBar) > 0 ? Number(initial.beatsPerBar) : 4;
+    }
+
+    function continueBarsToBeats(bars) {
+      return Number(bars) * beatsPerBar();
+    }
+
+    function continueBeatsToBars(beats) {
+      return Number(beats) / beatsPerBar();
+    }
+
+    function configureForOperation() {
+      const mode = operation();
+      const isContinue = mode === "continue";
+      const isGenerate = mode === "generate";
+      el("shell").dataset.operation = mode;
+      document.title = isGenerate ? "SA3 Generate" : isContinue ? "SA3 Continue" : "SA3 Transform";
+      el("title").textContent = isGenerate ? "SA3 Generate" : isContinue ? "SA3 Continue" : "SA3 Transform";
+      el("prompt").placeholder = isGenerate
+        ? "describe the audio to generate"
+        : isContinue
+          ? "where should this section go next"
+          : "warm shoegaze guitars";
+      el("actionButton").textContent = isGenerate ? "Generate" : isContinue ? "Continue" : "Transform";
+      el("replaceSelection").checked = isGenerate || isContinue ? true : Boolean(initial.replaceSelection);
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      el("backendUrl").value = initial.backendUrl;
+      el("prompt").value = initial.prompt;
+      el("strength").value = String(initial.strength);
+      el("strengthValue").textContent = Number(initial.strength).toFixed(2);
+      el("steps").value = String(initial.steps);
+      el("cfgScale").value = String(initial.cfgScale);
+      el("shift").value = initial.shift;
+      el("negativePrompt").value = initial.negativePrompt;
+      el("seed").value = initial.seed > -1 ? String(initial.seed) : initial.lastSeed || "";
+      el("useSeed").checked = Boolean(initial.useSeed);
+      el("lastSeed").textContent = initial.lastSeed ? `last seed: ${initial.lastSeed}` : "last seed: none";
+      el("replaceSelection").checked = Boolean(initial.replaceSelection);
+      const initialContinueBeats = initial.continueBeats > 0 ? initial.continueBeats : initial.selectionBeats || beatsPerBar();
+      el("continueBars").value = String(Number(continueBeatsToBars(initialContinueBeats).toFixed(2)));
+      el("selection").textContent = initial.selectionLabel;
+      el("music").textContent = [initial.tempoLabel, initial.keyScaleLabel].filter(Boolean).join(" / ");
+      setStatus(initial.statusMessage || "");
+      configureForOperation();
+      updateBackendModeUi();
+
+      renderLoras();
+      void checkBackendHealth();
+
+      el("strength").addEventListener("input", (event) => {
+        el("strengthValue").textContent = Number(event.target.value).toFixed(2);
+      });
+      el("backendToggle").addEventListener("click", toggleBackend);
+      el("backendUrl").addEventListener("change", () => {
+        updateBackendModeUi();
+        void checkBackendHealth();
+        void refreshLorasInPlace();
+      });
+      el("healthCheck").addEventListener("click", () => {
+        setHealth("checking...", "pending");
+        void checkBackendHealth();
+      });
+      el("useLoras").addEventListener("change", updateLoraVisibility);
+      el("useSeed").addEventListener("change", updateSeedEnabled);
+      el("diceButton").addEventListener("click", () => {
+        void rollDiceInPlace();
+      });
+      el("refreshLoras").addEventListener("click", () => {
+        void refreshLorasInPlace();
+      });
+      el("cancelButton").addEventListener("click", () => closeWithResult({ action: "cancel" }));
+      el("actionButton").addEventListener("click", () => closeWithAction(operation()));
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") closeWithResult({ action: "cancel" });
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") closeWithAction(operation());
+      });
+      updateSeedEnabled();
+      el("prompt").focus();
+    });
+  </script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    * { margin: 0; }
+    input, button, select, textarea { font: inherit; }
+
+    :root {
+      --bg: #363636;
+      --control: #202020;
+      --control-hover: #292929;
+      --border: #111;
+      --text: #d0d0d0;
+      --muted: #8a8a8a;
+      --accent: #ffb15f;
+      --accent-text: #151515;
+    }
+
+    html {
+      background: var(--bg);
+      color: var(--text);
+      font-family: "AbletonSansSmall", Arial, sans-serif;
+      font-size: 11.5px;
+      font-weight: 500;
+      height: 100%;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body {
+      min-height: 100%;
+      padding: 14px;
+    }
+
+    .shell {
+      display: grid;
+      gap: 10px;
+    }
+
+    .title-row,
+    .meta-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    h1 {
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .selection,
+    .music,
+    .muted,
+    .status {
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 76px 76px 90px;
+      gap: 8px;
+    }
+
+    .full { grid-column: 1 / -1; }
+    .wide { grid-column: span 2; }
+
+    .continue-only { display: none; }
+    .shell[data-operation="continue"] .continue-only { display: grid; }
+    .shell[data-operation="continue"] .transform-only { display: none; }
+    .shell[data-operation="generate"] .transform-only { display: none; }
+
+    label {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+      color: var(--muted);
+    }
+
+    input, select {
+      width: 100%;
+      height: 22px;
+      min-width: 0;
+      border: 1px solid var(--border);
+      background: var(--control);
+      color: var(--text);
+      padding: 0 6px;
+      outline-offset: 0;
+    }
+
+    input:focus, select:focus {
+      outline: 2px solid var(--muted);
+    }
+
+    input:disabled {
+      opacity: 0.62;
+      color: var(--muted);
+      cursor: default;
+    }
+
+    input[type="range"] {
+      padding: 0;
+      accent-color: var(--accent);
+    }
+
+    .prompt-row {
+      display: grid;
+      grid-template-columns: 1fr 50px;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .backend-row {
+      display: grid;
+      grid-template-columns: 68px 1fr 58px minmax(96px, 126px);
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .health-status {
+      min-width: 0;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .health-status[data-state="online"] { color: #8fd484; }
+    .health-status[data-state="offline"] { color: #ff7d6e; }
+    .health-status[data-state="pending"] { color: var(--accent); }
+
+    .range-row {
+      display: grid;
+      grid-template-columns: 1fr 42px;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .check-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text);
+      min-height: 22px;
+    }
+
+    .check-row input {
+      width: 14px;
+      height: 14px;
+      accent-color: var(--accent);
+    }
+
+    .seed-cell {
+      display: grid;
+      grid-template-columns: 58px 1fr;
+      grid-template-rows: 22px 14px;
+      align-items: center;
+      gap: 2px 6px;
+      min-width: 0;
+    }
+
+    .seed-cell .check-row {
+      grid-column: 1;
+      grid-row: 1;
+      min-height: 22px;
+    }
+
+    .seed-cell input[type="number"] {
+      grid-column: 2;
+      grid-row: 1;
+    }
+
+    .seed-note {
+      grid-column: 1 / -1;
+      grid-row: 2;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 10.5px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    details {
+      border-top: 1px solid #242424;
+      padding-top: 8px;
+    }
+
+    summary {
+      cursor: pointer;
+      color: var(--text);
+      height: 22px;
+      list-style-position: inside;
+      user-select: none;
+    }
+
+    .advanced-grid {
+      display: grid;
+      gap: 8px;
+      padding-top: 6px;
+    }
+
+    .advanced-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .lora-rows {
+      display: grid;
+      gap: 5px;
+      max-height: 126px;
+      overflow-y: auto;
+      padding-right: 2px;
+    }
+
+    .lora-rows.disabled {
+      opacity: 0.45;
+    }
+
+    .lora-row {
+      display: grid;
+      grid-template-columns: minmax(110px, 1fr) minmax(120px, 2fr) 42px;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+    }
+
+    .lora-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--text);
+    }
+
+    .lora-value {
+      color: var(--muted);
+      text-align: right;
+    }
+
+    .buttons {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    button {
+      height: 22px;
+      min-width: 50px;
+      border: 1px solid var(--border);
+      background: var(--control);
+      color: var(--text);
+      padding: 0 10px;
+      cursor: pointer;
+    }
+
+    button:hover { background: var(--control-hover); }
+    button:disabled {
+      cursor: default;
+      opacity: 0.45;
+    }
+
+    button.primary {
+      min-width: 72px;
+      background: var(--accent);
+      color: var(--accent-text);
+    }
+
+    button.primary:hover { filter: brightness(1.04); }
+  </style>
+</head>
+<body>
+  <div class="shell" id="shell">
+    <div class="title-row">
+      <h1 id="title">SA3 Transform</h1>
+      <div class="selection" id="selection"></div>
+    </div>
+    <div class="meta-row">
+      <div class="music" id="music"></div>
+      <div class="status" id="loraStatus"></div>
+    </div>
+    <div class="grid">
+      <label class="full">
+        backend
+        <div class="backend-row">
+          <button id="backendToggle" type="button">remote</button>
+          <input id="backendUrl" type="text" spellcheck="false">
+          <button id="healthCheck" type="button">check</button>
+          <div class="health-status" id="healthStatus"></div>
+        </div>
+      </label>
+      <label class="full">
+        prompt
+        <div class="prompt-row">
+          <input id="prompt" type="text" placeholder="warm shoegaze guitars">
+          <button id="diceButton" type="button" title="roll prompt">dice</button>
+        </div>
+      </label>
+      <label class="wide transform-only">
+        init noise
+        <div class="range-row">
+          <input id="strength" type="range" min="0.01" max="1" step="0.01">
+          <span id="strengthValue"></span>
+        </div>
+      </label>
+      <label class="wide continue-only">
+        duration (bars)
+        <input id="continueBars" type="number" min="0.25" max="256" step="0.25">
+      </label>
+      <label>
+        steps
+        <input id="steps" type="number" min="4" max="16" step="1">
+      </label>
+      <label>
+        cfg
+        <input id="cfgScale" type="number" min="0.5" max="2" step="0.1">
+      </label>
+      <label>
+        shift
+        <select id="shift">
+          <option value="full">full</option>
+          <option value="default">default</option>
+          <option value="none">none</option>
+          <option value="logsnr">logsnr</option>
+          <option value="flux">flux</option>
+        </select>
+      </label>
+      <div class="seed-cell">
+        <label class="check-row">
+          <input id="useSeed" type="checkbox">
+          seed
+        </label>
+        <input id="seed" type="number" step="1" placeholder="random">
+        <div class="seed-note" id="lastSeed"></div>
+      </div>
+      <label class="wide">
+        negative
+        <input id="negativePrompt" type="text" placeholder="low quality">
+      </label>
+      <label class="check-row full transform-only">
+        <input id="replaceSelection" type="checkbox">
+        replace selection
+      </label>
+    </div>
+    <details id="advanced">
+      <summary>advanced</summary>
+      <div class="advanced-grid">
+        <div class="advanced-header">
+          <label class="check-row">
+            <input id="useLoras" type="checkbox">
+            use loras
+          </label>
+          <button id="refreshLoras" type="button">refresh</button>
+        </div>
+        <div class="lora-rows" id="loraRows"></div>
+      </div>
+    </details>
+    <div class="buttons">
+      <button id="cancelButton" type="button">Cancel</button>
+      <button id="actionButton" class="primary" type="button">Transform</button>
+    </div>
+  </div>
+</body>
+</html>

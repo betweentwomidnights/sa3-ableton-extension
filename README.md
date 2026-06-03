@@ -16,6 +16,12 @@ the extension adds three right-click actions on audio-track arrangement selectio
 - `Gary SA3: Continue Selection`
 - `Gary SA3: Generate Selection`
 
+it also adds whole-clip fallback actions on audio clips:
+
+- `Gary SA3: Transform Whole Clip`
+- `Gary SA3: Continue Whole Clip`
+- `Gary SA3: Generate Over Clip Duration`
+
 transform renders the selected audio range, sends it to an SA3 backend, and replaces the selected region by default.
 
 continue renders the selected audio range, asks SA3 for a longer inpaint continuation, and replaces from the selection start with the returned source-plus-continuation clip.
@@ -182,7 +188,9 @@ on macOS, the Extension Host log lives under:
 ~/Library/Preferences/Ableton/Live x.x.x/ExtensionHost.txt
 ```
 
-if Live is running, developer mode is enabled, and the host is started but those `gary-sa3` log lines never appear, the extension entrypoint is not activating yet. if the log lines do appear but the menu is missing, make sure you are selecting an arrangement time range on an audio track and right-clicking that selected arrangement area.
+if Live is running, developer mode is enabled, and the host is started but those `gary-sa3` log lines never appear, the extension entrypoint is not activating yet. if the log lines do appear but the arrangement-selection menu is missing, make sure you are selecting an arrangement time range on an audio track and right-clicking that selected arrangement area.
+
+if the whole-clip actions appear but the arrangement-selection actions do not, try Ableton's SDK `examples/audio-clips` project on the same machine. it registers `AudioTrack.ArrangementSelection` too, so it is a good way to tell whether Live/macOS is currently hiding that beta context-menu scope.
 
 ## status
 

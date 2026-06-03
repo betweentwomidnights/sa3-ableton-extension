@@ -1,4 +1,5 @@
 import {
+  AudioClip,
   AudioTrack,
   DataModelObject,
   initialize,
@@ -6,6 +7,7 @@ import {
   type ArrangementSelection,
   type ContextMenuScope,
   type ExtensionContext,
+  type Handle,
 } from "@ableton-extensions/sdk";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
@@ -19,6 +21,9 @@ const API_VERSION = "1.0.0";
 const COMMAND_TRANSFORM_SELECTION = "gary.sa3.transformSelection";
 const COMMAND_CONTINUE_SELECTION = "gary.sa3.continueSelection";
 const COMMAND_GENERATE_SELECTION = "gary.sa3.generateSelection";
+const COMMAND_TRANSFORM_CLIP = "gary.sa3.transformClip";
+const COMMAND_CONTINUE_CLIP = "gary.sa3.continueClip";
+const COMMAND_GENERATE_CLIP = "gary.sa3.generateClip";
 const DEFAULT_LOCAL_SA3_URL = "http://localhost:8006";
 
 type Context = ExtensionContext<typeof API_VERSION>;
@@ -136,6 +141,27 @@ export function activate(activation: ActivationContext) {
     });
   });
 
+  context.commands.registerCommand(COMMAND_TRANSFORM_CLIP, (arg: unknown) => {
+    console.log("[gary-sa3] transform clip command invoked");
+    void processAudioClip(context, arg as Handle, "transform").catch((error) => {
+      console.error("[gary-sa3] transform clip failed", error);
+    });
+  });
+
+  context.commands.registerCommand(COMMAND_CONTINUE_CLIP, (arg: unknown) => {
+    console.log("[gary-sa3] continue clip command invoked");
+    void processAudioClip(context, arg as Handle, "continue").catch((error) => {
+      console.error("[gary-sa3] continue clip failed", error);
+    });
+  });
+
+  context.commands.registerCommand(COMMAND_GENERATE_CLIP, (arg: unknown) => {
+    console.log("[gary-sa3] generate clip command invoked");
+    void processAudioClip(context, arg as Handle, "generate").catch((error) => {
+      console.error("[gary-sa3] generate clip failed", error);
+    });
+  });
+
   void registerContextMenus(context).catch((error) => {
     console.error("[gary-sa3] context menu registration failed", error);
   });
@@ -159,6 +185,24 @@ async function registerContextMenus(context: Context) {
     "AudioTrack.ArrangementSelection",
     "Gary SA3: Generate Selection",
     COMMAND_GENERATE_SELECTION,
+  );
+  await registerMenuAction(
+    context,
+    "AudioClip",
+    "Gary SA3: Transform Whole Clip",
+    COMMAND_TRANSFORM_CLIP,
+  );
+  await registerMenuAction(
+    context,
+    "AudioClip",
+    "Gary SA3: Continue Whole Clip",
+    COMMAND_CONTINUE_CLIP,
+  );
+  await registerMenuAction(
+    context,
+    "AudioClip",
+    "Gary SA3: Generate Over Clip Duration",
+    COMMAND_GENERATE_CLIP,
   );
 }
 
@@ -396,6 +440,37 @@ async function runTransformDialog(
       }
     }
   }
+}
+
+async function processAudioClip(
+  context: Context,
+  handle: Handle,
+  operation: SelectionOperation,
+) {
+  const clip = context.getObjectFromHandle(handle, AudioClip);
+  const track = findAudioTrackParent(clip);
+  if (!track) {
+    console.error("[gary-sa3] Audio clip is not on an audio track.");
+    return;
+  }
+
+  const selection: ArrangementSelection = {
+    time_selection_start: clip.startTime,
+    time_selection_end: clip.endTime,
+    selected_lanes: [track.handle],
+  };
+  await processSelection(context, selection, operation);
+}
+
+function findAudioTrackParent(object: DataModelObject<typeof API_VERSION>): AudioTrack<typeof API_VERSION> | null {
+  let current: DataModelObject<typeof API_VERSION> | null = object;
+  while (current) {
+    if (current instanceof AudioTrack) {
+      return current;
+    }
+    current = current.parent;
+  }
+  return null;
 }
 
 async function showTransformDialog(

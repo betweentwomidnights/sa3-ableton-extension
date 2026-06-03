@@ -118,7 +118,26 @@ run in Live developer mode:
 npm start
 ```
 
-create a local `.env` file from [.env.example](.env.example) that points `EXTENSION_HOST_PATH` at the Live install root, Ableton Live executable, ExtensionHost directory, or `ExtensionHostNodeModule.node`.
+before `npm start`, create a local `.env` file from [.env.example](.env.example). this is required unless you pass `--live` manually:
+
+```shell
+cp .env.example .env
+```
+
+on macOS, `.env` should usually contain:
+
+```shell
+EXTENSION_HOST_PATH=/Applications/Ableton Live 12 Beta.app
+```
+
+on Windows, `.env` should usually contain one of:
+
+```shell
+EXTENSION_HOST_PATH=C:\ProgramData\Ableton\Live 12 Beta
+EXTENSION_HOST_PATH=C:\ProgramData\Ableton\Live 12 Beta\Program\Ableton Live.exe
+```
+
+`EXTENSION_HOST_PATH` can point at the Live install root, Live executable/app bundle, ExtensionHost directory, or `ExtensionHostNodeModule.node`.
 
 for the most reliable tested Windows 11 Live 12 beta workflow:
 
@@ -147,6 +166,8 @@ on macOS, if you want to pass Live's `.app` path directly:
 ```shell
 npm run start:cli -- --live "/Applications/Ableton Live 12 Beta.app"
 ```
+
+passing `--live` overrides `.env`, which is useful for quick debugging. plain `npm start` needs `.env`.
 
 avoid `--inspect` unless you are attaching a debugger. in this SDK beta, `--inspect` uses a break-on-start debugging mode, so the Extension Host can print `Started: Extension Host` while the extension code itself is still paused. if the extension activates, Ableton's Extension Host log should include lines like:
 

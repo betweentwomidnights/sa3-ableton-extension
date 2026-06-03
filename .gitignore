@@ -7,3 +7,9 @@ dist/
 *-stdout.txt
 *-stderr.txt
 vendor/*.tgz
+backend/outputs/
+backend/loras/
+backend/lora_registry.json
+backend/.venv/
+__pycache__/
+*.pyc

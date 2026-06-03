@@ -34,7 +34,7 @@ Tested today with the Gary4local companion app:
 
 https://github.com/betweentwomidnights/gary-localhost-installer
 
-We are extracting a standalone backend from Gary4local's `services/sa3/api.py` so people can run a small API wrapper around their existing official Stable Audio 3 checkout. The goal is to stay as close as possible to upstream:
+The standalone backend in [backend/](backend/) was extracted from Gary4local's `services/sa3/api.py` so people can run a small API wrapper around their existing official Stable Audio 3 checkout. The goal is to stay as close as possible to upstream:
 
 https://github.com/Stability-AI/stable-audio-3
 
@@ -52,7 +52,29 @@ The extension expects an SA3-compatible HTTP backend with:
 - `POST /continue`
 - `GET /poll_status/<session_id>`
 
-The local backend work-in-progress also preserves useful output-shaping environment variables from Gary4local, including latent scaling, peak normalization, and a gentle limiter. See [PUBLIC_RELEASE_PLAN.md](PUBLIC_RELEASE_PLAN.md).
+The local backend also preserves useful output-shaping environment variables from Gary4local, including latent scaling, peak normalization, and a gentle limiter. See [PUBLIC_RELEASE_PLAN.md](PUBLIC_RELEASE_PLAN.md).
+
+Backend extraction is now in [backend/](backend/). Start with [backend/README.md](backend/README.md).
+
+## Ableton Beta Sequence
+
+This sequence matters with the current Ableton Extensions SDK beta:
+
+1. Download the Ableton Live beta and Ableton Extensions SDK from:
+   https://ableton.github.io/extensions-sdk/
+2. If building from source, copy the SDK tarballs into [vendor/](vendor/) and run `npm install`.
+3. Package the extension with `npm run package:ablx`, or use a provided `.ablx` release artifact.
+4. Open Ableton Live beta first.
+5. Enable Developer Mode in Preferences -> Extensions.
+6. Install the `.ablx` extension from Live's extension UI.
+7. Restart Ableton Live beta.
+8. After Live has restarted and knows the extension is installed, run:
+
+```shell
+npm start
+```
+
+In our Windows 11 beta testing, running `npm start` before Live had seen and installed the extension meant the context-menu entries did not appear. The reliable order was: install in Live, restart Live, then start the dev host from the terminal.
 
 ## Ableton SDK Setup
 
@@ -90,7 +112,7 @@ Run in Live developer mode with the Windows host bootstrap:
 npm start
 ```
 
-Create a local `.env` file that points `EXTENSION_HOST_PATH` at the Live install root, Ableton Live executable, ExtensionHost directory, or `ExtensionHostNodeModule.node`.
+Create a local `.env` file from [.env.example](.env.example) that points `EXTENSION_HOST_PATH` at the Live install root, Ableton Live executable, ExtensionHost directory, or `ExtensionHostNodeModule.node`.
 
 For the most reliable tested Windows 11 Live 12 beta workflow:
 

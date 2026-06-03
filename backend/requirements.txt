@@ -1,0 +1,9 @@
+# Minimal API wrapper dependencies.
+#
+# Install the official Stable Audio 3 package separately so you can choose the
+# right torch/CUDA/Flash Attention path for your machine.
+flask>=3.0
+flask-cors>=6.0
+soundfile>=0.13.1
+einops>=0.8.2
+huggingface-hub>=1.7.1

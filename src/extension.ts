@@ -20,6 +20,9 @@ const COMMAND_TRANSFORM_SELECTION = "gary.sa3.transformSelection";
 const COMMAND_CONTINUE_SELECTION = "gary.sa3.continueSelection";
 const COMMAND_GENERATE_SELECTION = "gary.sa3.generateSelection";
 const DEFAULT_LOCAL_SA3_URL = "http://localhost:8006";
+let warnedMissingStorageDirectory = false;
+let warnedSettingsWriteFailure = false;
+let inMemorySettings: TransformSettings | undefined;
 
 type Context = ExtensionContext<typeof API_VERSION>;
 type SelectionOperation = "transform" | "continue" | "generate";
@@ -201,6 +204,7 @@ async function processSelection(
     ...defaultSettings,
     ...storedSettings,
   });
+  const initialSettings = settings;
   if (operation === "continue" && settings.continueBeats <= 0) {
     settings = {
       ...settings,
@@ -222,6 +226,12 @@ async function processSelection(
   });
 
   if (dialogResult.action !== operation || !dialogResult.settings) {
+    if (dialogResult.settings) {
+      await writeStoredSettings(
+        context,
+        settingsForStorage(initialSettings, sanitizeSettings(dialogResult.settings), operation),
+      );
+    }
     return;
   }
 
@@ -232,7 +242,7 @@ async function processSelection(
       continueBeats: clamp(selectionBeats, 0.25, 1024),
     };
   }
-  await writeStoredSettings(context, settings);
+  await writeStoredSettings(context, settingsForStorage(initialSettings, settings, operation));
 
   const title = operation === "generate"
     ? "SA3 Generate"
@@ -324,7 +334,7 @@ async function processSelection(
     await update("done", 100);
   });
 
-  await writeStoredSettings(context, settings);
+  await writeStoredSettings(context, settingsForStorage(initialSettings, settings, operation));
 }
 
 async function runTransformDialog(
@@ -368,11 +378,19 @@ async function runTransformDialog(
 
     if (result.settings) {
       settings = sanitizeSettings(result.settings);
+      await writeStoredSettings(
+        context,
+        settingsForStorage(initial.settings, settings, initial.operation),
+      );
     }
 
     if (result.action === "refresh-loras") {
       loraNames = await fetchAvailableLoras(settings.backendUrl);
       statusMessage = loraStatusMessage(loraNames);
+      await writeStoredSettings(
+        context,
+        settingsForStorage(initial.settings, settings, initial.operation),
+      );
       continue;
     }
 
@@ -386,6 +404,10 @@ async function runTransformDialog(
           ...settings,
           prompt: dice.prompt,
         };
+        await writeStoredSettings(
+          context,
+          settingsForStorage(initial.settings, settings, initial.operation),
+        );
         statusMessage = dice.missingLoras.length > 0
           ? `rolled prompt; missing ${dice.missingLoras.length} lora pool${dice.missingLoras.length === 1 ? "" : "s"}`
           : settings.loras.length > 0
@@ -406,11 +428,22 @@ async function showTransformDialog(
     "__INITIAL_JSON__",
     JSON.stringify(initial).replaceAll("</", "<\\/"),
   );
-  const server = await startDialogServer(html);
+  let storedSettings = sanitizeSettings(initial);
+  const server = await startDialogServer(html, {
+    onSettings: async (settings) => {
+      storedSettings = settingsForStorage(storedSettings, sanitizeSettings(settings), initial.operation);
+      await writeStoredSettings(context, storedSettings);
+    },
+  });
 
   try {
     const result = await context.ui.showModalDialog(server.url, 620, 500);
-    return JSON.parse(result) as DialogResult;
+    const dialogResult = JSON.parse(result) as DialogResult;
+    if (dialogResult.settings) {
+      storedSettings = settingsForStorage(storedSettings, sanitizeSettings(dialogResult.settings), initial.operation);
+      await writeStoredSettings(context, storedSettings);
+    }
+    return dialogResult;
   } finally {
     await server.close();
   }
@@ -654,9 +687,14 @@ async function fetchJson<T = Record<string, unknown>>(
   return json as T;
 }
 
-async function startDialogServer(html: string): Promise<{ url: string; close: () => Promise<void> }> {
+async function startDialogServer(
+  html: string,
+  options: {
+    onSettings?: (settings: TransformSettings) => Promise<void>;
+  } = {},
+): Promise<{ url: string; close: () => Promise<void> }> {
   const server = http.createServer((request, response) => {
-    void handleDialogRequest(html, request, response).catch((error) => {
+    void handleDialogRequest(html, options, request, response).catch((error) => {
       sendJson(response, 500, {
         success: false,
         error: error instanceof Error ? error.message : "dialog bridge failed",
@@ -689,10 +727,29 @@ async function startDialogServer(html: string): Promise<{ url: string; close: ()
 
 async function handleDialogRequest(
   html: string,
+  options: {
+    onSettings?: (settings: TransformSettings) => Promise<void>;
+  },
   request: http.IncomingMessage,
   response: http.ServerResponse,
 ) {
   const route = parseRequestUrl(request.url ?? "/");
+
+  if (route.path === "/api/settings" && request.method === "POST") {
+    if (!options.onSettings) {
+      sendJson(response, 501, { success: false, error: "settings persistence unavailable" });
+      return;
+    }
+
+    const payload = await readJsonBody(request);
+    const settings = sanitizeSettings({
+      ...defaultSettings,
+      ...asRecord(payload),
+    } as TransformSettings);
+    await options.onSettings(settings);
+    sendJson(response, 200, { success: true });
+    return;
+  }
 
   if (request.method !== "GET") {
     sendJson(response, 405, { success: false, error: "method not allowed" });
@@ -745,6 +802,16 @@ function sendJson(response: http.ServerResponse, status: number, body: unknown) 
     "Cache-Control": "no-store",
   });
   response.end(JSON.stringify(body));
+}
+
+async function readJsonBody(request: http.IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const text = Buffer.concat(chunks).toString("utf8").trim();
+  return text ? JSON.parse(text) : {};
 }
 
 async function fetchJsonWithTimeout<T = unknown>(url: string, timeoutMs: number): Promise<T> {
@@ -814,6 +881,21 @@ function sanitizeSettings(settings: TransformSettings): TransformSettings {
     replaceSelection: Boolean(settings.replaceSelection),
     continueBeats: clamp(Number(settings.continueBeats), 0, 1024),
     loras: sanitizeLoras(settings.loras),
+  };
+}
+
+function settingsForStorage(
+  previous: TransformSettings,
+  next: TransformSettings,
+  operation: SelectionOperation,
+): TransformSettings {
+  if (operation === "transform") {
+    return next;
+  }
+
+  return {
+    ...next,
+    replaceSelection: previous.replaceSelection,
   };
 }
 
@@ -944,30 +1026,49 @@ function addDiceBucketPrompts(
 async function readStoredSettings(context: Context): Promise<Partial<TransformSettings>> {
   const filePath = settingsFilePath(context);
   if (!filePath) {
-    return {};
+    return inMemorySettings ?? {};
   }
 
   try {
-    return JSON.parse(await fs.readFile(filePath, "utf8")) as Partial<TransformSettings>;
+    const settings = JSON.parse(await fs.readFile(filePath, "utf8")) as Partial<TransformSettings>;
+    inMemorySettings = sanitizeSettings({
+      ...defaultSettings,
+      ...settings,
+    });
+    return settings;
   } catch {
-    return {};
+    return inMemorySettings ?? {};
   }
 }
 
 async function writeStoredSettings(context: Context, settings: TransformSettings) {
+  inMemorySettings = sanitizeSettings(settings);
   const filePath = settingsFilePath(context);
   if (!filePath) {
     return;
   }
 
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(settings, null, 2));
+  try {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, JSON.stringify(inMemorySettings, null, 2));
+  } catch (error) {
+    if (!warnedSettingsWriteFailure) {
+      warnedSettingsWriteFailure = true;
+      console.warn("[gary-sa3] settings write failed; falling back to in-memory dialog state", error);
+    }
+  }
 }
 
 function settingsFilePath(context: Context): string | undefined {
-  return context.environment.storageDirectory
-    ? path.join(context.environment.storageDirectory, "gary-sa3-transform.json")
-    : undefined;
+  if (!context.environment.storageDirectory) {
+    if (!warnedMissingStorageDirectory) {
+      warnedMissingStorageDirectory = true;
+      console.warn("[gary-sa3] settings storage unavailable; falling back to in-memory dialog state");
+    }
+    return undefined;
+  }
+
+  return path.join(context.environment.storageDirectory, "gary-sa3-transform.json");
 }
 
 function getMusicContext(context: Context): MusicContext {

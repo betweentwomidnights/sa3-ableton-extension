@@ -12,6 +12,7 @@
       window.webkit.messageHandlers &&
       window.webkit.messageHandlers.live;
     const isWebView2 = window.chrome && window.chrome.webview;
+    let saveTimer = 0;
 
     function sendMessage(message) {
       if (isWebKitMessageHandlerAvailable) {
@@ -56,6 +57,31 @@
       };
     }
 
+    async function persistSettingsNow() {
+      clearTimeout(saveTimer);
+      saveTimer = 0;
+
+      try {
+        await fetch("/api/settings", {
+          method: "POST",
+          headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(readSettings())
+        });
+      } catch {
+        // Persistence is best-effort; final close still carries settings to the host.
+      }
+    }
+
+    function persistSettingsSoon() {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        void persistSettingsNow();
+      }, 250);
+    }
+
     function readLoras() {
       if (!checked("useLoras")) {
         return [];
@@ -71,6 +97,14 @@
 
     function closeWithAction(action) {
       closeWithResult({ action, settings: readSettings() });
+    }
+
+    async function closeAfterPersist(action) {
+      try {
+        await persistSettingsNow();
+      } finally {
+        closeWithAction(action);
+      }
     }
 
     function setStatus(text) {
@@ -104,6 +138,7 @@
     function resetBackendToLocal() {
       el("backendUrl").value = localBackendUrl;
       updateBackendModeUi();
+      persistSettingsSoon();
       setHealth("checking...", "pending");
       void checkBackendHealth();
       void refreshLorasInPlace();
@@ -154,11 +189,13 @@
         }
         const missingLoras = Array.isArray(json.missingLoras) ? json.missingLoras : [];
         el("prompt").value = json.prompt;
+        persistSettingsSoon();
         setStatus(missingLoras.length > 0
           ? `rolled prompt; missing ${missingLoras.length} lora pool${missingLoras.length === 1 ? "" : "s"}`
           : loras.length > 0 ? "rolled lora prompt" : "rolled prompt");
       } catch (error) {
         setStatus("rolling via extension host...");
+        await persistSettingsNow();
         closeWithAction("dice");
         return;
       } finally {
@@ -278,8 +315,10 @@
         availableLoras = json.loras;
         setStatus(json.statusMessage || "");
         renderLoras();
+        persistSettingsSoon();
       } catch (error) {
         setStatus("refreshing via extension host...");
+        await persistSettingsNow();
         closeWithAction("refresh-loras");
       } finally {
         button.disabled = false;
@@ -365,6 +404,8 @@
       renderLoras();
       void checkBackendHealth();
 
+      el("shell").addEventListener("input", persistSettingsSoon);
+      el("shell").addEventListener("change", persistSettingsSoon);
       el("strength").addEventListener("input", (event) => {
         el("strengthValue").textContent = Number(event.target.value).toFixed(2);
       });
@@ -386,11 +427,15 @@
       el("refreshLoras").addEventListener("click", () => {
         void refreshLorasInPlace();
       });
-      el("cancelButton").addEventListener("click", () => closeWithResult({ action: "cancel" }));
-      el("actionButton").addEventListener("click", () => closeWithAction(operation()));
+      el("cancelButton").addEventListener("click", () => {
+        void closeAfterPersist("cancel");
+      });
+      el("actionButton").addEventListener("click", () => {
+        void closeAfterPersist(operation());
+      });
       document.addEventListener("keydown", (event) => {
-        if (event.key === "Escape") closeWithResult({ action: "cancel" });
-        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") closeWithAction(operation());
+        if (event.key === "Escape") void closeAfterPersist("cancel");
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") void closeAfterPersist(operation());
       });
       updateSeedEnabled();
       el("prompt").focus();

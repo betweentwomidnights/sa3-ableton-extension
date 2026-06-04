@@ -2,7 +2,9 @@
 
 stable audio 3 generation, transformation, and continuation directly inside Ableton Live arrangement selections.
 
-fair warning...there's a bit of setup involved and you'll have to run at least one terminal while using the ableton beta (two terminals if you're not using gary4local)
+**UPDATE:** oops, i misunderstood how easy it was to use just the `.ablx` file if you disable developer mode. if you only want to use the extension, install [gary-extension.ablx](releases/gary-extension.ablx) inside Ableton Live beta with Developer Mode off.
+
+fair warning...you still need an SA3 backend while generating, either Gary4local or the backend in this repo. but you do not need to run the Ableton extension host from a terminal unless you're building on top of this.
 
 2nd warning...untested on macOS. plz let me know if it works/doesn't work on apple silicon.
 
@@ -64,11 +66,26 @@ LoRA setup is documented in [backend/LORAS.md](backend/LORAS.md), including regi
 
 ## ableton beta sequence
 
-this sequence matters with the current Ableton Extensions SDK beta:
+### easiest install
+
+this is the path if you just want to use the extension:
+
+1. Download the Ableton Live beta from:
+   https://ableton.github.io/extensions-sdk/
+2. Download [gary-extension.ablx](releases/gary-extension.ablx) from this repo.
+3. Open Ableton Live beta.
+4. In Preferences -> Extensions, make sure Developer Mode is disabled.
+5. Install the `.ablx` extension from Live's extension UI.
+6. Restart Ableton Live beta if the menu entries do not appear.
+7. Make sure an SA3 backend is running at `http://localhost:8006`, or edit the backend URL in the extension dialog.
+
+### developer mode
+
+this sequence matters if you are building from source or running Ableton's dev host:
 
 1. Download the Ableton Live beta and Ableton Extensions SDK from:
    https://ableton.github.io/extensions-sdk/
-2. If building from source, copy the SDK tarballs into [vendor/](vendor/) and run `npm install`.
+2. Copy the SDK tarballs into [vendor/](vendor/) and run `npm install`.
 3. Package the extension with `npm run package:ablx`, or use a provided `.ablx` release artifact.
 4. Open Ableton Live beta first.
 5. Enable Developer Mode in Preferences -> Extensions.
@@ -80,7 +97,7 @@ this sequence matters with the current Ableton Extensions SDK beta:
 npm start
 ```
 
-in our Windows 11 beta testing, running `npm start` before Live had seen and installed the extension meant the context-menu entries did not appear. the reliable order was: install in Live (enable developer mode), restart Live, then start the dev host from the terminal.
+in our Windows 11 beta testing, running `npm start` before Live had seen and installed the extension meant the context-menu entries did not appear. the reliable developer-mode order was: install in Live, restart Live, then start the dev host from the terminal.
 
 ## Ableton SDK setup
 

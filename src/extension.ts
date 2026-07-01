@@ -655,7 +655,7 @@ function sa3CppRequest(
     cfg_scale: settings.cfgScale,
     dist_shift: sa3CppDistShift(settings.shift),
     seed: settings.useSeed ? settings.seed : -1,
-    keep_models: true,
+    keep_models: false,
     loras: settings.loras.map((lora) => ({
       name: lora.name,
       strength: lora.strength,

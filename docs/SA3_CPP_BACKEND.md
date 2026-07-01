@@ -22,7 +22,7 @@ From `C:\dev\sa3.cpp`:
 ```powershell
 build.cmd cuda
 python tools\download_models.py --variant medium --encoding f16
-server.cmd --port 8086
+.\scripts\run-server.ps1
 ```
 
 Health should respond without loading the model:
@@ -51,7 +51,12 @@ which lets `sa3-server` work.
 Generate sends both backend dialects in one request:
 
 - Python backend: `duration`, `shift`
-- `sa3.cpp`: `seconds`, `dist_shift`, `keep_models: true`
+- `sa3.cpp`: `seconds`, `dist_shift`, `keep_models: false`
+
+The extension requests frugal/early-free mode for `sa3.cpp` so long audio
+transforms and continuations have the best chance of fitting on 8 GB GPUs. That
+costs a reload between requests, but avoids keeping T5, DiT, and the decoder
+resident while Ableton is also active.
 
 Transform first tries the legacy Python route:
 
@@ -84,14 +89,11 @@ If that route is missing, it falls back to `POST /generate` with:
 
 `sa3-server` does not currently expose:
 
-- `GET /loras`
-- `GET /prompts`
 - `POST /transform`
 - `POST /continue`
 
-The extension works around the last two. LoRA and dice UX will be limited until
-`sa3-server` grows `/loras` and `/prompts`, or we add a tiny adapter route layer
-there.
+The extension works around those by falling back to `POST /generate` with
+`init_path`.
 
 The extension also does not embed `libsa3`. That is still possible later through
 a native Node addon or an external helper process, but the HTTP server is the

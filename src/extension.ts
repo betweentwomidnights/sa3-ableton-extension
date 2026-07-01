@@ -656,6 +656,10 @@ function sa3CppRequest(
     dist_shift: sa3CppDistShift(settings.shift),
     seed: settings.useSeed ? settings.seed : -1,
     keep_models: false,
+    encode_chunk_size: 128,
+    encode_overlap: 32,
+    decode_chunk_size: 128,
+    decode_overlap: 32,
     loras: settings.loras.map((lora) => ({
       name: lora.name,
       strength: lora.strength,

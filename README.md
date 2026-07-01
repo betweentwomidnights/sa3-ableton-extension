@@ -64,6 +64,10 @@ backend extraction is now in [backend/](backend/). start with [backend/README.md
 
 LoRA setup is documented in [backend/LORAS.md](backend/LORAS.md), including registry JSON, prompt dice files, and API checks.
 
+## sa3.cpp backend experiment
+
+There is an experimental branch for driving [`sa3.cpp`](https://github.com/betweentwomidnights/sa3.cpp)'s `sa3-server` directly from the Ableton extension. See [docs/SA3_CPP_BACKEND.md](docs/SA3_CPP_BACKEND.md).
+
 ## ableton beta sequence
 
 ### easiest install

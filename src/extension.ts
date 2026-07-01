@@ -98,6 +98,17 @@ interface TransformResult {
   seed?: string;
 }
 
+class BackendHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly responseBody: unknown,
+    fallback: string,
+  ) {
+    super(errorFromResponse(responseBody, fallback));
+    this.name = "BackendHttpError";
+  }
+}
+
 const defaultSettings: TransformSettings = {
   backendUrl: DEFAULT_LOCAL_SA3_URL,
   prompt: "",
@@ -284,6 +295,7 @@ async function processSelection(
           settings,
           sourceWavPath,
           musicContext,
+          beatsToSeconds(selectionBeats, musicContext.tempo),
           beatsToSeconds(settings.continueBeats, musicContext.tempo),
           (text, progress) => update(`${prefix}${text}`, ((i + progress) / tracks.length) * 100),
           signal,
@@ -293,6 +305,7 @@ async function processSelection(
           settings,
           sourceWavPath,
           musicContext,
+          beatsToSeconds(selectionBeats, musicContext.tempo),
           (text, progress) => update(`${prefix}${text}`, ((i + progress) / tracks.length) * 100),
           signal,
         );
@@ -454,6 +467,7 @@ async function submitAndDownloadTransform(
   settings: TransformSettings,
   sourceWavPath: string,
   musicContext: MusicContext,
+  durationSeconds: number,
   update: (text: string, progress: number) => Promise<void>,
   signal: AbortSignal,
 ): Promise<TransformResult> {
@@ -462,28 +476,29 @@ async function submitAndDownloadTransform(
   const prompt = composePrompt(settings.prompt, musicContext);
   const baseUrl = normalizeBaseUrl(settings.backendUrl);
 
-  const submitResponse = await fetchJson(`${baseUrl}/transform`, {
-    prompt,
-    audio_data: audioData,
-    strength: settings.strength,
-    steps: settings.steps,
-    cfg_scale: settings.cfgScale,
-    shift: settings.shift,
-    seed: settings.useSeed ? settings.seed : -1,
-    loras: settings.loras.map((lora) => ({
-      name: lora.name,
-      strength: lora.strength,
-      interval_min: 0.0,
-      interval_max: 1.0,
-    })),
-    ...(settings.negativePrompt ? { negative_prompt: settings.negativePrompt } : {}),
-  }, signal);
+  let sessionId: string;
+  try {
+    const submitResponse = await fetchJson(`${baseUrl}/transform`, {
+      ...legacySa3Request(settings, prompt),
+      audio_data: audioData,
+      strength: settings.strength,
+    }, signal);
+    sessionId = sessionIdFromSubmit(submitResponse, "SA3 transform submit failed");
+  } catch (error) {
+    if (!shouldFallbackToSa3Cpp(error)) {
+      throw error;
+    }
 
-  if (!submitResponse.success || typeof submitResponse.session_id !== "string") {
-    throw new Error(errorFromResponse(submitResponse, "SA3 transform submit failed"));
+    console.log("[gary-sa3] /transform unavailable; falling back to sa3.cpp /generate init_path");
+    const submitResponse = await fetchJson(`${baseUrl}/generate`, {
+      ...sa3CppRequest(settings, prompt, durationSeconds),
+      init_path: sourceWavPath,
+      init_noise_level: settings.strength,
+    }, signal);
+    sessionId = sessionIdFromSubmit(submitResponse, "SA3 sa3.cpp transform submit failed");
   }
 
-  const status = await pollForCompletion(baseUrl, submitResponse.session_id, update, signal, "SA3 transform");
+  const status = await pollForCompletion(baseUrl, sessionId, update, signal, "SA3 transform");
   if (!status.audio_data) {
     throw new Error("SA3 completed without audio_data.");
   }
@@ -518,26 +533,14 @@ async function submitAndDownloadGenerate(
   const baseUrl = normalizeBaseUrl(settings.backendUrl);
 
   const submitResponse = await fetchJson(`${baseUrl}/generate`, {
-    prompt,
+    ...legacySa3Request(settings, prompt),
     duration: Number(durationSeconds.toFixed(3)),
-    steps: settings.steps,
-    cfg_scale: settings.cfgScale,
-    shift: settings.shift,
-    seed: settings.useSeed ? settings.seed : -1,
-    loras: settings.loras.map((lora) => ({
-      name: lora.name,
-      strength: lora.strength,
-      interval_min: 0.0,
-      interval_max: 1.0,
-    })),
-    ...(settings.negativePrompt ? { negative_prompt: settings.negativePrompt } : {}),
+    ...sa3CppRequest(settings, prompt, durationSeconds),
   }, signal);
 
-  if (!submitResponse.success || typeof submitResponse.session_id !== "string") {
-    throw new Error(errorFromResponse(submitResponse, "SA3 generate submit failed"));
-  }
+  const sessionId = sessionIdFromSubmit(submitResponse, "SA3 generate submit failed");
 
-  const status = await pollForCompletion(baseUrl, submitResponse.session_id, update, signal, "SA3 generate");
+  const status = await pollForCompletion(baseUrl, sessionId, update, signal, "SA3 generate");
   if (!status.audio_data) {
     throw new Error("SA3 completed without audio_data.");
   }
@@ -565,6 +568,7 @@ async function submitAndDownloadContinue(
   settings: TransformSettings,
   sourceWavPath: string,
   musicContext: MusicContext,
+  sourceDurationSeconds: number,
   continuationSeconds: number,
   update: (text: string, progress: number) => Promise<void>,
   signal: AbortSignal,
@@ -577,30 +581,33 @@ async function submitAndDownloadContinue(
   const audioData = sourceBytes.toString("base64");
   const prompt = composePrompt(settings.prompt, musicContext);
   const baseUrl = normalizeBaseUrl(settings.backendUrl);
+  const totalDurationSeconds = sourceDurationSeconds + continuationSeconds;
 
-  const submitResponse = await fetchJson(`${baseUrl}/continue`, {
-    prompt,
-    audio_data: audioData,
-    continuation_seconds: Number(continuationSeconds.toFixed(3)),
-    continuation_mode: "inpaint",
-    steps: settings.steps,
-    cfg_scale: settings.cfgScale,
-    shift: settings.shift,
-    seed: settings.useSeed ? settings.seed : -1,
-    loras: settings.loras.map((lora) => ({
-      name: lora.name,
-      strength: lora.strength,
-      interval_min: 0.0,
-      interval_max: 1.0,
-    })),
-    ...(settings.negativePrompt ? { negative_prompt: settings.negativePrompt } : {}),
-  }, signal);
+  let sessionId: string;
+  try {
+    const submitResponse = await fetchJson(`${baseUrl}/continue`, {
+      ...legacySa3Request(settings, prompt),
+      audio_data: audioData,
+      continuation_seconds: Number(continuationSeconds.toFixed(3)),
+      continuation_mode: "inpaint",
+    }, signal);
+    sessionId = sessionIdFromSubmit(submitResponse, "SA3 continue submit failed");
+  } catch (error) {
+    if (!shouldFallbackToSa3Cpp(error)) {
+      throw error;
+    }
 
-  if (!submitResponse.success || typeof submitResponse.session_id !== "string") {
-    throw new Error(errorFromResponse(submitResponse, "SA3 continue submit failed"));
+    console.log("[gary-sa3] /continue unavailable; falling back to sa3.cpp /generate inpaint");
+    const submitResponse = await fetchJson(`${baseUrl}/generate`, {
+      ...sa3CppRequest(settings, prompt, totalDurationSeconds),
+      init_path: sourceWavPath,
+      inpaint_start: Number(sourceDurationSeconds.toFixed(3)),
+      inpaint_end: Number(totalDurationSeconds.toFixed(3)),
+    }, signal);
+    sessionId = sessionIdFromSubmit(submitResponse, "SA3 sa3.cpp continue submit failed");
   }
 
-  const status = await pollForCompletion(baseUrl, submitResponse.session_id, update, signal, "SA3 continue");
+  const status = await pollForCompletion(baseUrl, sessionId, update, signal, "SA3 continue");
   if (!status.audio_data) {
     throw new Error("SA3 completed without audio_data.");
   }
@@ -617,6 +624,77 @@ async function submitAndDownloadContinue(
   return seed === undefined
     ? { filePath: outputPath }
     : { filePath: outputPath, seed: String(seed) };
+}
+
+function legacySa3Request(settings: TransformSettings, prompt: string): Record<string, unknown> {
+  return {
+    prompt,
+    steps: settings.steps,
+    cfg_scale: settings.cfgScale,
+    shift: settings.shift,
+    seed: settings.useSeed ? settings.seed : -1,
+    loras: settings.loras.map((lora) => ({
+      name: lora.name,
+      strength: lora.strength,
+      interval_min: 0.0,
+      interval_max: 1.0,
+    })),
+    ...(settings.negativePrompt ? { negative_prompt: settings.negativePrompt } : {}),
+  };
+}
+
+function sa3CppRequest(
+  settings: TransformSettings,
+  prompt: string,
+  durationSeconds: number,
+): Record<string, unknown> {
+  return {
+    prompt,
+    seconds: Number(durationSeconds.toFixed(3)),
+    steps: settings.steps,
+    cfg_scale: settings.cfgScale,
+    dist_shift: sa3CppDistShift(settings.shift),
+    seed: settings.useSeed ? settings.seed : -1,
+    keep_models: true,
+    loras: settings.loras.map((lora) => ({
+      name: lora.name,
+      strength: lora.strength,
+    })),
+    ...(settings.negativePrompt ? { negative_prompt: settings.negativePrompt } : {}),
+  };
+}
+
+function sa3CppDistShift(shift: string): string {
+  switch (shift.toLowerCase()) {
+    case "none":
+      return "None";
+    case "flux":
+      return "Flux";
+    case "full":
+      return "Full";
+    case "default":
+    case "logsnr":
+    default:
+      return "LogSNR";
+  }
+}
+
+function sessionIdFromSubmit(response: unknown, fallback: string): string {
+  const record = asRecord(response);
+  if (record?.success === false) {
+    throw new Error(errorFromResponse(response, fallback));
+  }
+
+  const sessionId = typeof record?.session_id === "string" ? record.session_id.trim() : "";
+  if (!sessionId) {
+    throw new Error(errorFromResponse(response, fallback));
+  }
+
+  return sessionId;
+}
+
+function shouldFallbackToSa3Cpp(error: unknown): boolean {
+  return error instanceof BackendHttpError && (error.status === 404 || error.status === 405);
 }
 
 async function pollForCompletion(
@@ -677,11 +755,15 @@ async function fetchJson<T = Record<string, unknown>>(
   const text = await response.text();
   let json: unknown = {};
   if (text.trim()) {
-    json = JSON.parse(text);
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = { message: text.trim() };
+    }
   }
 
   if (!response.ok) {
-    throw new Error(errorFromResponse(json, `HTTP ${response.status}`));
+    throw new BackendHttpError(response.status, json, `HTTP ${response.status}`);
   }
 
   return json as T;

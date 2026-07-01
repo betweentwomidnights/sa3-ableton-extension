@@ -712,7 +712,7 @@ async function pollForCompletion(
     await delay(1500, signal);
 
     const status = await fetchJson<PollStatus>(
-      `${baseUrl}/poll_status/${encodeURIComponent(sessionId)}`,
+      `${baseUrl}/poll_status/${encodeURIComponent(sessionId)}?consume=1`,
       undefined,
       signal,
     );

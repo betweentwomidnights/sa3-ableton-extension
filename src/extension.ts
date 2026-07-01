@@ -275,7 +275,10 @@ async function processSelection(
       let sourceWavPath = "";
       if (operation !== "generate") {
         await update(`${prefix}rendering ${track.name}`, (i / tracks.length) * 100);
+        console.log(`[gary-sa3] rendering ${operation} source: track="${track.name}" beats=${startBeat}-${endBeat}`);
         sourceWavPath = await context.resources.renderPreFxAudio(track, startBeat, endBeat);
+        const sourceInfo = await fs.stat(sourceWavPath);
+        console.log(`[gary-sa3] rendered source wav: ${sourceWavPath} (${sourceInfo.size} bytes)`);
         signal.throwIfAborted();
       }
 
@@ -471,31 +474,42 @@ async function submitAndDownloadTransform(
   update: (text: string, progress: number) => Promise<void>,
   signal: AbortSignal,
 ): Promise<TransformResult> {
-  const sourceBytes = await fs.readFile(sourceWavPath);
-  const audioData = sourceBytes.toString("base64");
   const prompt = composePrompt(settings.prompt, musicContext);
   const baseUrl = normalizeBaseUrl(settings.backendUrl);
 
   let sessionId: string;
-  try {
-    const submitResponse = await fetchJson(`${baseUrl}/transform`, {
-      ...legacySa3Request(settings, prompt),
-      audio_data: audioData,
-      strength: settings.strength,
-    }, signal);
-    sessionId = sessionIdFromSubmit(submitResponse, "SA3 transform submit failed");
-  } catch (error) {
-    if (!shouldFallbackToSa3Cpp(error)) {
-      throw error;
-    }
-
-    console.log("[gary-sa3] /transform unavailable; falling back to sa3.cpp /generate init_path");
+  const useInitPath = await shouldPreferSa3CppInitPath(baseUrl, signal);
+  if (useInitPath) {
+    console.log("[gary-sa3] sa3.cpp backend detected; submitting transform via /generate init_path");
     const submitResponse = await fetchJson(`${baseUrl}/generate`, {
       ...sa3CppRequest(settings, prompt, durationSeconds),
       init_path: sourceWavPath,
       init_noise_level: settings.strength,
     }, signal);
     sessionId = sessionIdFromSubmit(submitResponse, "SA3 sa3.cpp transform submit failed");
+  } else {
+    const sourceBytes = await fs.readFile(sourceWavPath);
+    const audioData = sourceBytes.toString("base64");
+    try {
+      const submitResponse = await fetchJson(`${baseUrl}/transform`, {
+        ...legacySa3Request(settings, prompt),
+        audio_data: audioData,
+        strength: settings.strength,
+      }, signal);
+      sessionId = sessionIdFromSubmit(submitResponse, "SA3 transform submit failed");
+    } catch (error) {
+      if (!shouldFallbackToSa3Cpp(error)) {
+        throw error;
+      }
+
+      console.log("[gary-sa3] /transform unavailable; falling back to sa3.cpp /generate init_path");
+      const submitResponse = await fetchJson(`${baseUrl}/generate`, {
+        ...sa3CppRequest(settings, prompt, durationSeconds),
+        init_path: sourceWavPath,
+        init_noise_level: settings.strength,
+      }, signal);
+      sessionId = sessionIdFromSubmit(submitResponse, "SA3 sa3.cpp transform submit failed");
+    }
   }
 
   const status = await pollForCompletion(baseUrl, sessionId, update, signal, "SA3 transform");
@@ -577,27 +591,14 @@ async function submitAndDownloadContinue(
     throw new Error("SA3 continue needs a positive continuation length.");
   }
 
-  const sourceBytes = await fs.readFile(sourceWavPath);
-  const audioData = sourceBytes.toString("base64");
   const prompt = composePrompt(settings.prompt, musicContext);
   const baseUrl = normalizeBaseUrl(settings.backendUrl);
   const totalDurationSeconds = sourceDurationSeconds + continuationSeconds;
 
   let sessionId: string;
-  try {
-    const submitResponse = await fetchJson(`${baseUrl}/continue`, {
-      ...legacySa3Request(settings, prompt),
-      audio_data: audioData,
-      continuation_seconds: Number(continuationSeconds.toFixed(3)),
-      continuation_mode: "inpaint",
-    }, signal);
-    sessionId = sessionIdFromSubmit(submitResponse, "SA3 continue submit failed");
-  } catch (error) {
-    if (!shouldFallbackToSa3Cpp(error)) {
-      throw error;
-    }
-
-    console.log("[gary-sa3] /continue unavailable; falling back to sa3.cpp /generate inpaint");
+  const useInitPath = await shouldPreferSa3CppInitPath(baseUrl, signal);
+  if (useInitPath) {
+    console.log("[gary-sa3] sa3.cpp backend detected; submitting continue via /generate init_path");
     const submitResponse = await fetchJson(`${baseUrl}/generate`, {
       ...sa3CppRequest(settings, prompt, totalDurationSeconds),
       init_path: sourceWavPath,
@@ -605,6 +606,31 @@ async function submitAndDownloadContinue(
       inpaint_end: Number(totalDurationSeconds.toFixed(3)),
     }, signal);
     sessionId = sessionIdFromSubmit(submitResponse, "SA3 sa3.cpp continue submit failed");
+  } else {
+    const sourceBytes = await fs.readFile(sourceWavPath);
+    const audioData = sourceBytes.toString("base64");
+    try {
+      const submitResponse = await fetchJson(`${baseUrl}/continue`, {
+        ...legacySa3Request(settings, prompt),
+        audio_data: audioData,
+        continuation_seconds: Number(continuationSeconds.toFixed(3)),
+        continuation_mode: "inpaint",
+      }, signal);
+      sessionId = sessionIdFromSubmit(submitResponse, "SA3 continue submit failed");
+    } catch (error) {
+      if (!shouldFallbackToSa3Cpp(error)) {
+        throw error;
+      }
+
+      console.log("[gary-sa3] /continue unavailable; falling back to sa3.cpp /generate inpaint");
+      const submitResponse = await fetchJson(`${baseUrl}/generate`, {
+        ...sa3CppRequest(settings, prompt, totalDurationSeconds),
+        init_path: sourceWavPath,
+        inpaint_start: Number(sourceDurationSeconds.toFixed(3)),
+        inpaint_end: Number(totalDurationSeconds.toFixed(3)),
+      }, signal);
+      sessionId = sessionIdFromSubmit(submitResponse, "SA3 sa3.cpp continue submit failed");
+    }
   }
 
   const status = await pollForCompletion(baseUrl, sessionId, update, signal, "SA3 continue");
@@ -699,6 +725,20 @@ function sessionIdFromSubmit(response: unknown, fallback: string): string {
 
 function shouldFallbackToSa3Cpp(error: unknown): boolean {
   return error instanceof BackendHttpError && (error.status === 404 || error.status === 405);
+}
+
+async function shouldPreferSa3CppInitPath(baseUrl: string, signal: AbortSignal): Promise<boolean> {
+  try {
+    const health = await fetchJson<unknown>(`${baseUrl}/health`, undefined, signal);
+    const record = asRecord(health);
+    const status = String(record?.status ?? "").toLowerCase();
+    const isSa3Cpp = status === "ok" && typeof record?.encoding === "string" && typeof record?.loaded === "boolean";
+    console.log(`[gary-sa3] backend flavor ${isSa3Cpp ? "sa3.cpp" : "legacy"} (${baseUrl})`);
+    return isSa3Cpp;
+  } catch (error) {
+    console.warn("[gary-sa3] backend flavor check failed; using legacy submit route", error);
+    return false;
+  }
 }
 
 async function pollForCompletion(

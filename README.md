@@ -20,7 +20,7 @@ the extension adds three right-click actions on audio-track arrangement selectio
 
 transform renders the selected audio range, sends it to an SA3 backend, and replaces the selected region by default.
 
-continue renders the selected audio range, asks SA3 for a longer inpaint continuation, and replaces from the selection start with the returned source-plus-continuation clip.
+continue renders the selected audio range, asks SA3 to add the requested number of bars after it, and replaces from the selection start with the returned source-plus-continuation clip.
 
 generate uses the selected arrangement duration to create audio from text and places the result at the selected start.
 

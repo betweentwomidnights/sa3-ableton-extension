@@ -151,7 +151,13 @@ The wrapper includes local output-shaping controls that are not part of official
 - `SA3_PEAK_NORMALIZE_DB`
 - `SA3_LIMITER_CEILING_DB`
 - `SA3_LIMITER_KNEE`
+- `SA3_TAIL_PAD_SECONDS`
+- `SA3_TAIL_PAD_MAX`
 - `SA3_CONTINUE_TAIL_MODE`
-- `SA3_CONTINUE_TAIL_PAD`
+- `SA3_CONTINUE_TAIL_PAD` as a compatibility alias
 
 Copy [.env.example](.env.example) for the full list.
+
+`SA3_TAIL_PAD_SECONDS` applies to text generation and continuation: the server
+generates a little past the requested end, then trims the returned WAV to the
+requested duration. Plain audio-to-audio transform keeps the source length.

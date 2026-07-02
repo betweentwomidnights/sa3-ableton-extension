@@ -103,9 +103,11 @@ DEFAULT_SAMPLER = os.environ.get("SA3_DEFAULT_SAMPLER", "pingpong")
 DEFAULT_LOOP_BARS = int(os.environ.get("SA3_DEFAULT_LOOP_BARS", "8"))
 LOOP_PAD_SECONDS = float(os.environ.get("SA3_LOOP_PAD_SECONDS", "2.0"))
 DEFAULT_CONTINUATION_SECONDS = float(os.environ.get("SA3_DEFAULT_CONTINUATION_SECONDS", "8.0"))
+TAIL_PAD_SECONDS = float(os.environ.get("SA3_TAIL_PAD_SECONDS", os.environ.get("SA3_CONTINUE_TAIL_PAD", "6.0")))
+TAIL_PAD_MAX = float(os.environ.get("SA3_TAIL_PAD_MAX", os.environ.get("SA3_CONTINUE_TAIL_PAD_MAX", "60.0")))
 CONTINUE_TAIL_MODE = os.environ.get("SA3_CONTINUE_TAIL_MODE", "regen_past").lower()
-CONTINUE_TAIL_PAD = float(os.environ.get("SA3_CONTINUE_TAIL_PAD", "6.0"))
-CONTINUE_TAIL_PAD_MAX = float(os.environ.get("SA3_CONTINUE_TAIL_PAD_MAX", "60.0"))
+CONTINUE_TAIL_PAD = float(os.environ.get("SA3_CONTINUE_TAIL_PAD", os.environ.get("SA3_TAIL_PAD_SECONDS", "6.0")))
+CONTINUE_TAIL_PAD_MAX = float(os.environ.get("SA3_CONTINUE_TAIL_PAD_MAX", os.environ.get("SA3_TAIL_PAD_MAX", "60.0")))
 OUTPUT_SAMPLE_RATE = int(os.environ.get("SA3_SAMPLE_RATE", "44100"))
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR") or str(BASE_DIR / "outputs")
@@ -151,7 +153,7 @@ LIMITER_KNEE = float(os.environ.get("SA3_LIMITER_KNEE", "0.8"))
 # A ceiling, not a fixed allocation: StableAudioModel adapts this down to the
 # requested duration. It prevents the upstream 120s default cap from clipping
 # legitimate longer local requests.
-MAX_SAMPLE_SIZE = int((MAX_DURATION + CONTINUE_TAIL_PAD_MAX + 40.0) * OUTPUT_SAMPLE_RATE)
+MAX_SAMPLE_SIZE = int((MAX_DURATION + max(TAIL_PAD_MAX, CONTINUE_TAIL_PAD_MAX) + 40.0) * OUTPUT_SAMPLE_RATE)
 
 SA3_MODEL_LINKS = {
     "stable-audio-3-medium": "https://huggingface.co/stabilityai/stable-audio-3-medium",
@@ -454,6 +456,14 @@ def parse_optional_float(data: dict[str, Any], key: str, default: float | None) 
     if isinstance(raw, str) and raw.strip().lower() in {"off", "none", "disable", "disabled"}:
         return None
     return float(raw)
+
+
+def parse_tail_pad(data: dict[str, Any], default: float = TAIL_PAD_SECONDS) -> float:
+    for key in ("tail_pad_seconds", "tail_pad", "continuation_tail_pad"):
+        raw = data.get(key)
+        if raw not in (None, ""):
+            return min(TAIL_PAD_MAX, max(0.0, float(raw)))
+    return min(TAIL_PAD_MAX, max(0.0, default))
 
 
 def parse_peak_normalize_db(data: dict[str, Any]) -> float | None:
@@ -949,6 +959,7 @@ def health():
                 "peak_normalize_db": PEAK_NORM_DB,
                 "limiter_ceiling_db": LIMITER_CEILING_DB,
                 "limiter_knee": LIMITER_KNEE,
+                "tail_pad_seconds": TAIL_PAD_SECONDS,
                 "continuation_tail_mode": CONTINUE_TAIL_MODE,
                 "continuation_tail_pad": CONTINUE_TAIL_PAD,
             },
@@ -1117,13 +1128,25 @@ def generate():
     if errors:
         return jsonify({"success": False, "errors": errors}), 400
 
-    params = common_params(data)
+    duration = parse_float(data, "duration", DEFAULT_DURATION)
+    tail_pad = parse_tail_pad(data)
+    gen_duration = duration + tail_pad
+
+    target_samples = round(duration * OUTPUT_SAMPLE_RATE)
+    params = common_params(data, duration=gen_duration)
+    params["target_samples"] = target_samples
+    params["generate"] = {
+        "duration": round(duration, 6),
+        "tail_pad": round(tail_pad, 6),
+        "gen_duration": round(gen_duration, 6),
+        "target_samples": target_samples,
+    }
     session_id = create_session(
         {
             "mode": "generate",
             "prompt": params["prompt"],
             "steps": params["steps"],
-            "duration": params["duration"],
+            "duration": duration,
         }
     )
     threading.Thread(target=generation_worker, args=(session_id, params), daemon=True).start()
@@ -1133,7 +1156,7 @@ def generate():
             "session_id": session_id,
             "seed": params["seed"],
             "prompt": params["prompt"],
-            "duration": params["duration"],
+            **params["generate"],
         }
     )
 
@@ -1251,7 +1274,7 @@ def continue_audio():
 
     source_duration = waveform.shape[-1] / float(input_sr)
     continuation_seconds = parse_float(data, "continuation_seconds", DEFAULT_CONTINUATION_SECONDS)
-    tail_pad = min(CONTINUE_TAIL_PAD_MAX, max(0.0, parse_float(data, "continuation_tail_pad", CONTINUE_TAIL_PAD)))
+    tail_pad = min(CONTINUE_TAIL_PAD_MAX, parse_tail_pad(data, CONTINUE_TAIL_PAD))
     total_duration = source_duration + continuation_seconds
     if source_duration <= 0 or continuation_seconds <= 0 or total_duration > MAX_DURATION:
         return jsonify({"success": False, "error": f"source + continuation must be in (0, {MAX_DURATION}] seconds"}), 400

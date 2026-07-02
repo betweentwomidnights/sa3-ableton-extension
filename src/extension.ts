@@ -9,6 +9,7 @@ import {
 } from "@ableton-extensions/sdk";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
+import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
@@ -20,6 +21,7 @@ const COMMAND_TRANSFORM_SELECTION = "gary.sa3.transformSelection";
 const COMMAND_CONTINUE_SELECTION = "gary.sa3.continueSelection";
 const COMMAND_GENERATE_SELECTION = "gary.sa3.generateSelection";
 const DEFAULT_LOCAL_SA3_URL = "http://localhost:8006";
+const SA3_CPP_TAIL_PAD_SECONDS = 6.0;
 let warnedMissingStorageDirectory = false;
 let warnedSettingsWriteFailure = false;
 let inMemorySettings: TransformSettings | undefined;
@@ -132,21 +134,21 @@ export function activate(activation: ActivationContext) {
   context.commands.registerCommand(COMMAND_TRANSFORM_SELECTION, (arg: unknown) => {
     console.log("[gary-sa3] transform command invoked");
     void processSelection(context, arg as ArrangementSelection, "transform").catch((error) => {
-      console.error("[gary-sa3] transform failed", error);
+      void handleCommandError(context, "transform", error);
     });
   });
 
   context.commands.registerCommand(COMMAND_CONTINUE_SELECTION, (arg: unknown) => {
     console.log("[gary-sa3] continue command invoked");
     void processSelection(context, arg as ArrangementSelection, "continue").catch((error) => {
-      console.error("[gary-sa3] continue failed", error);
+      void handleCommandError(context, "continue", error);
     });
   });
 
   context.commands.registerCommand(COMMAND_GENERATE_SELECTION, (arg: unknown) => {
     console.log("[gary-sa3] generate command invoked");
     void processSelection(context, arg as ArrangementSelection, "generate").catch((error) => {
-      console.error("[gary-sa3] generate failed", error);
+      void handleCommandError(context, "generate", error);
     });
   });
 
@@ -353,6 +355,19 @@ async function processSelection(
   await writeStoredSettings(context, settingsForStorage(initialSettings, settings, operation));
 }
 
+async function handleCommandError(
+  context: Context,
+  operation: SelectionOperation,
+  error: unknown,
+) {
+  console.error(`[gary-sa3] ${operation} failed`, error);
+  try {
+    await showErrorDialog(context, `SA3 ${capitalize(operation)} Failed`, error);
+  } catch (dialogError) {
+    console.error("[gary-sa3] failed to show error dialog", dialogError);
+  }
+}
+
 async function runTransformDialog(
   context: Context,
   initial: {
@@ -465,6 +480,88 @@ async function showTransformDialog(
   }
 }
 
+async function showErrorDialog(context: Context, title: string, error: unknown) {
+  const message = errorToMessage(error);
+  const details = errorToDetails(error);
+  const html = errorDialogHtml(title, message, details);
+  const server = await startDialogServer(html);
+
+  try {
+    await context.ui.showModalDialog(server.url, 520, details ? 300 : 210);
+  } finally {
+    await server.close();
+  }
+}
+
+function errorDialogHtml(title: string, message: string, details: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)}</title>
+  <script>
+    function closeDialog() {
+      const message = { method: "close_and_send", params: ["ok"] };
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.live) {
+        window.webkit.messageHandlers.live.postMessage(message);
+      } else if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.postMessage(message);
+      }
+    }
+    document.addEventListener("DOMContentLoaded", () => {
+      document.getElementById("ok").addEventListener("click", closeDialog);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" || event.key === "Enter") closeDialog();
+      });
+      document.getElementById("ok").focus();
+    });
+  </script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      background: #363636;
+      color: #d0d0d0;
+      font-family: "AbletonSansSmall", Arial, sans-serif;
+      font-size: 11.5px;
+    }
+    .shell { display: grid; gap: 12px; }
+    h1 { margin: 0; font-size: 13px; }
+    p { margin: 0; line-height: 1.4; color: #f0b1a6; overflow-wrap: anywhere; }
+    pre {
+      max-height: 118px;
+      margin: 0;
+      padding: 8px;
+      overflow: auto;
+      white-space: pre-wrap;
+      background: #202020;
+      color: #bdbdbd;
+      border: 1px solid #111;
+    }
+    .buttons { display: flex; justify-content: flex-end; }
+    button {
+      height: 24px;
+      min-width: 62px;
+      border: 1px solid #111;
+      background: #ffb15f;
+      color: #151515;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(message)}</p>
+    ${details ? `<pre>${escapeHtml(details)}</pre>` : ""}
+    <div class="buttons"><button id="ok" type="button">OK</button></div>
+  </div>
+</body>
+</html>`;
+}
+
 async function submitAndDownloadTransform(
   context: Context,
   settings: TransformSettings,
@@ -485,6 +582,7 @@ async function submitAndDownloadTransform(
       ...sa3CppRequest(settings, prompt, durationSeconds),
       init_path: sourceWavPath,
       init_noise_level: settings.strength,
+      duration_padding_sec: 0.0,
     }, signal);
     sessionId = sessionIdFromSubmit(submitResponse, "SA3 sa3.cpp transform submit failed");
   } else {
@@ -507,6 +605,7 @@ async function submitAndDownloadTransform(
         ...sa3CppRequest(settings, prompt, durationSeconds),
         init_path: sourceWavPath,
         init_noise_level: settings.strength,
+        duration_padding_sec: 0.0,
       }, signal);
       sessionId = sessionIdFromSubmit(submitResponse, "SA3 sa3.cpp transform submit failed");
     }
@@ -517,9 +616,12 @@ async function submitAndDownloadTransform(
     throw new Error("SA3 completed without audio_data.");
   }
 
-  const tempDirectory = context.environment.tempDirectory ?? path.dirname(sourceWavPath);
-  const outputPath = path.join(tempDirectory, `gary-sa3-transform-${randomUUID()}.wav`);
-  await fs.writeFile(outputPath, Buffer.from(status.audio_data, "base64"));
+  const outputPath = await writeOutputWav(
+    context,
+    "transform",
+    status.audio_data,
+    path.dirname(sourceWavPath),
+  );
 
   const seed = status.meta?.seed;
   if (seed !== undefined) {
@@ -545,27 +647,25 @@ async function submitAndDownloadGenerate(
 
   const prompt = composePrompt(settings.prompt, musicContext);
   const baseUrl = normalizeBaseUrl(settings.backendUrl);
-
-  const submitResponse = await fetchJson(`${baseUrl}/generate`, {
+  const request = {
     ...legacySa3Request(settings, prompt),
-    duration: Number(durationSeconds.toFixed(3)),
     ...sa3CppRequest(settings, prompt, durationSeconds),
-  }, signal);
+  };
+  console.log(
+    `[gary-sa3] submitting generate to ${baseUrl}/generate duration=${request.duration} steps=${request.steps} loras=${settings.loras.length}`,
+  );
+
+  const submitResponse = await fetchJson(`${baseUrl}/generate`, request, signal);
 
   const sessionId = sessionIdFromSubmit(submitResponse, "SA3 generate submit failed");
+  console.log(`[gary-sa3] generate session ${sessionId}`);
 
   const status = await pollForCompletion(baseUrl, sessionId, update, signal, "SA3 generate");
   if (!status.audio_data) {
     throw new Error("SA3 completed without audio_data.");
   }
 
-  const tempDirectory = context.environment.tempDirectory;
-  if (!tempDirectory) {
-    throw new Error("Extension temp directory is unavailable.");
-  }
-
-  const outputPath = path.join(tempDirectory, `gary-sa3-generate-${randomUUID()}.wav`);
-  await fs.writeFile(outputPath, Buffer.from(status.audio_data, "base64"));
+  const outputPath = await writeOutputWav(context, "generate", status.audio_data);
 
   const seed = status.meta?.seed;
   if (seed !== undefined) {
@@ -594,16 +694,22 @@ async function submitAndDownloadContinue(
   const prompt = composePrompt(settings.prompt, musicContext);
   const baseUrl = normalizeBaseUrl(settings.backendUrl);
   const totalDurationSeconds = sourceDurationSeconds + continuationSeconds;
+  const sa3CppGenDurationSeconds = totalDurationSeconds + SA3_CPP_TAIL_PAD_SECONDS;
+  const targetSamples = durationToSamples(totalDurationSeconds);
 
   let sessionId: string;
   const useInitPath = await shouldPreferSa3CppInitPath(baseUrl, signal);
   if (useInitPath) {
-    console.log("[gary-sa3] sa3.cpp backend detected; submitting continue via /generate init_path");
+    console.log(
+      `[gary-sa3] sa3.cpp backend detected; submitting continue source=${sourceDurationSeconds.toFixed(3)}s add=${continuationSeconds.toFixed(3)}s total=${totalDurationSeconds.toFixed(3)}s gen=${sa3CppGenDurationSeconds.toFixed(3)}s target_samples=${targetSamples}`,
+    );
     const submitResponse = await fetchJson(`${baseUrl}/generate`, {
-      ...sa3CppRequest(settings, prompt, totalDurationSeconds),
+      ...sa3CppRequest(settings, prompt, sa3CppGenDurationSeconds),
       init_path: sourceWavPath,
       inpaint_start: Number(sourceDurationSeconds.toFixed(3)),
-      inpaint_end: Number(totalDurationSeconds.toFixed(3)),
+      inpaint_end: Number(sa3CppGenDurationSeconds.toFixed(3)),
+      target_samples: targetSamples,
+      duration_padding_sec: 0.0,
     }, signal);
     sessionId = sessionIdFromSubmit(submitResponse, "SA3 sa3.cpp continue submit failed");
   } else {
@@ -624,10 +730,12 @@ async function submitAndDownloadContinue(
 
       console.log("[gary-sa3] /continue unavailable; falling back to sa3.cpp /generate inpaint");
       const submitResponse = await fetchJson(`${baseUrl}/generate`, {
-        ...sa3CppRequest(settings, prompt, totalDurationSeconds),
+        ...sa3CppRequest(settings, prompt, sa3CppGenDurationSeconds),
         init_path: sourceWavPath,
         inpaint_start: Number(sourceDurationSeconds.toFixed(3)),
-        inpaint_end: Number(totalDurationSeconds.toFixed(3)),
+        inpaint_end: Number(sa3CppGenDurationSeconds.toFixed(3)),
+        target_samples: targetSamples,
+        duration_padding_sec: 0.0,
       }, signal);
       sessionId = sessionIdFromSubmit(submitResponse, "SA3 sa3.cpp continue submit failed");
     }
@@ -638,9 +746,12 @@ async function submitAndDownloadContinue(
     throw new Error("SA3 completed without audio_data.");
   }
 
-  const tempDirectory = context.environment.tempDirectory ?? path.dirname(sourceWavPath);
-  const outputPath = path.join(tempDirectory, `gary-sa3-continue-${randomUUID()}.wav`);
-  await fs.writeFile(outputPath, Buffer.from(status.audio_data, "base64"));
+  const outputPath = await writeOutputWav(
+    context,
+    "continue",
+    status.audio_data,
+    path.dirname(sourceWavPath),
+  );
 
   const seed = status.meta?.seed;
   if (seed !== undefined) {
@@ -676,7 +787,9 @@ function sa3CppRequest(
 ): Record<string, unknown> {
   return {
     prompt,
-    seconds: Number(durationSeconds.toFixed(3)),
+    duration: Number(durationSeconds.toFixed(3)),
+    target_samples: durationToSamples(durationSeconds),
+    duration_padding_sec: SA3_CPP_TAIL_PAD_SECONDS,
     steps: settings.steps,
     cfg_scale: settings.cfgScale,
     dist_shift: sa3CppDistShift(settings.shift),
@@ -709,6 +822,10 @@ function sa3CppDistShift(shift: string): string {
   }
 }
 
+function durationToSamples(durationSeconds: number): number {
+  return Math.max(1, Math.round(durationSeconds * 44100));
+}
+
 function sessionIdFromSubmit(response: unknown, fallback: string): string {
   const record = asRecord(response);
   if (record?.success === false) {
@@ -725,6 +842,24 @@ function sessionIdFromSubmit(response: unknown, fallback: string): string {
 
 function shouldFallbackToSa3Cpp(error: unknown): boolean {
   return error instanceof BackendHttpError && (error.status === 404 || error.status === 405);
+}
+
+async function writeOutputWav(
+  context: Context,
+  operation: SelectionOperation,
+  audioData: string,
+  fallbackDirectory?: string,
+): Promise<string> {
+  const tempDirectory =
+    context.environment.tempDirectory ??
+    fallbackDirectory ??
+    path.join(os.tmpdir(), "gary-sa3-ableton");
+  await fs.mkdir(tempDirectory, { recursive: true });
+
+  const outputPath = path.join(tempDirectory, `gary-sa3-${operation}-${randomUUID()}.wav`);
+  await fs.writeFile(outputPath, Buffer.from(audioData, "base64"));
+  console.log(`[gary-sa3] wrote ${operation} wav: ${outputPath}`);
+  return outputPath;
 }
 
 async function shouldPreferSa3CppInitPath(baseUrl: string, signal: AbortSignal): Promise<boolean> {
@@ -807,6 +942,7 @@ async function fetchJson<T = Record<string, unknown>>(
   }
 
   if (!response.ok) {
+    console.error(`[gary-sa3] HTTP ${response.status} ${url}`, json);
     throw new BackendHttpError(response.status, json, `HTTP ${response.status}`);
   }
 
@@ -1318,6 +1454,39 @@ function errorFromResponse(response: unknown, fallback: string): string {
   }
 
   return fallback;
+}
+
+function errorToMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim();
+  }
+
+  return String(error || "Unknown error");
+}
+
+function errorToDetails(error: unknown): string {
+  if (error instanceof BackendHttpError) {
+    return JSON.stringify(error.responseBody, null, 2);
+  }
+
+  if (error instanceof Error && error.stack) {
+    return error.stack;
+  }
+
+  return "";
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function capitalize(value: string): string {
+  return value ? value[0]!.toUpperCase() + value.slice(1) : value;
 }
 
 function makeClipName(prompt: string, trackName: string, operation: SelectionOperation): string {

@@ -231,6 +231,46 @@
       return fallback;
     }
 
+    function healthResponseLooksOnline(response) {
+      if (!response || typeof response !== "object") {
+        return response !== undefined && response !== null;
+      }
+      if (response.success === false || response.online === false) {
+        return false;
+      }
+
+      const status = String(response.status || "").trim().toLowerCase();
+      return !["unhealthy", "failed", "down", "error", "offline"].includes(status);
+    }
+
+    function healthStatusLabel(response) {
+      if (!response || typeof response !== "object") {
+        return "online";
+      }
+
+      return String(response.status || "").trim() || "online";
+    }
+
+    async function fetchBackendHealth() {
+      const backendUrl = normalizeUrl(value("backendUrl"));
+      if (backendMode() === "custom" && backendUrl) {
+        try {
+          const direct = await fetchJsonWithTimeout(`${backendUrl}/health`, 8000);
+          return {
+            success: true,
+            online: healthResponseLooksOnline(direct),
+            status: healthStatusLabel(direct)
+          };
+        } catch (error) {
+          console.warn("direct backend health failed; falling back to extension proxy", error);
+        }
+      }
+
+      return await fetchJsonWithTimeout(appendQuery("/api/health", {
+        backendUrl
+      }), 8000);
+    }
+
     function renderLoras() {
       const active = currentLoraStrengths();
       const names = availableLoras;
@@ -327,9 +367,7 @@
 
     async function checkBackendHealth() {
       try {
-        const json = await fetchJsonWithTimeout(appendQuery("/api/health", {
-          backendUrl: value("backendUrl")
-        }), 3000);
+        const json = await fetchBackendHealth();
         if (!json.success) {
           throw new Error(errorFromResponse(json, "health check failed"));
         }
@@ -756,7 +794,7 @@
         </div>
       </label>
       <label class="wide continue-only">
-        duration (bars)
+        add bars
         <input id="continueBars" type="number" min="0.25" max="256" step="0.25">
       </label>
       <label>

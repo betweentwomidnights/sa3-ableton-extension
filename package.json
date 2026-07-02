@@ -6,7 +6,7 @@
   "main": "dist/extension.js",
   "scripts": {
     "build": "tsc --noEmit && tsx build.ts",
-    "package:ablx": "npm run build && extensions-cli package -o dist/gary-extension.ablx",
+    "package:ablx": "npm run build && extensions-cli package -o dist/gary-extension.ablx && node scripts/copy-release.cjs",
     "start": "npm run start:cli",
     "start:cli": "npm run build && extensions-cli run",
     "start:debug": "npm run build && extensions-cli run --inspect",

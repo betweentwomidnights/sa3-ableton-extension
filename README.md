@@ -2,7 +2,7 @@
 
 stable audio 3 generation, transformation, and continuation directly inside Ableton Live arrangement selections.
 
-**UPDATE:** oops, i misunderstood how easy it was to use just the `.ablx` file if you disable developer mode. if you only want to use the extension, install [gary-extension.ablx](releases/gary-extension.ablx) inside Ableton Live beta with Developer Mode off.
+**UPDATE:** oops, i misunderstood how easy it was to use just the `.ablx` file if you disable developer mode. if you only want to use the extension, grab the latest `.ablx` from [Releases](https://github.com/betweentwomidnights/sa3-ableton-extension/releases) and install it inside Ableton Live beta with Developer Mode off.
 
 fair warning...you still need an SA3 backend while generating, either Gary4local or the backend in this repo. but you do not need to run the Ableton extension host from a terminal unless you're building on top of this.
 
@@ -68,6 +68,78 @@ LoRA setup is documented in [backend/LORAS.md](backend/LORAS.md), including regi
 
 There is an experimental branch for driving [`sa3.cpp`](https://github.com/betweentwomidnights/sa3.cpp)'s `sa3-server` directly from the Ableton extension. See [docs/SA3_CPP_BACKEND.md](docs/SA3_CPP_BACKEND.md).
 
+## embedded sa3.cpp backend (this branch)
+
+this branch embeds `sa3.cpp` directly inside the extension as a native node addon — no separate backend process. select `embedded` in the dialog's backend toggle.
+
+### builds (cuda / vulkan / cpu)
+
+the addon itself is backend-agnostic — it `LoadLibrary`s `sa3.dll` at runtime, so the only difference between builds is which `ggml` runtime DLLs are bundled next to it. three flavours:
+
+| backend | build script | bundled DLLs | .ablx size | notes |
+| --- | --- | --- | --- | --- |
+| cuda   | `npm run package:cuda`   | `ggml-cuda` + CUDA runtime (`cublas*`, `cudart*`) | ~600 MB | fastest on NVIDIA; huge because of the CUDA runtime |
+| vulkan | `npm run package:vulkan` | `ggml-vulkan` | ~15 MB | runs on any Vulkan GPU (NVIDIA/AMD/Intel); needs the system Vulkan loader (`vulkan-1.dll`, ships with GPU drivers). basically as fast as CUDA for this workload |
+| cpu    | `npm run package:cpu`    | `ggml-cpu-*` micro-arch variants | ~3 MB | no GPU needed; picks the best AVX level at runtime. slow for `medium`, genuinely usable for `small-music` |
+
+`npm run package:all` builds all three in one pass (compiling the addon once). outputs land in `dist/gary-extension-<backend>.ablx` (also copied into the gitignored `releases/`). the backend is selected at build time with `GARY_SA3_BACKEND=cuda|vulkan|cpu`, mapping to the `sa3.cpp/build-cuda`, `build-vulkan`, and `build-cpu-variants` runtime dirs respectively.
+
+note: all three share the extension id `gary.gary-extension`, so only one can be installed at a time — installing a second replaces the first.
+
+### device toggle (auto / cpu)
+
+the dialog's embedded panel has a **device** dropdown:
+
+- `auto` — use the GPU if the build has one (cuda/vulkan), else CPU.
+- `cpu` — force the CPU backend, even on a GPU build (both the cuda and vulkan builds bundle `ggml-cpu.dll`, so this always works).
+
+switching device recreates the libsa3 context on the next generation. handy for A/B-ing GPU vs CPU, and CPU is genuinely usable for `small-music`.
+
+under the hood this sets `sa3_config_ex.device` in libsa3 (added on `main`); the CLI's `SA3_DEVICE=cpu` / `SA3_GPU=<index-or-name>` env vars still work as the fallback when no explicit device is passed.
+
+### the sandbox (why there is no file picker)
+
+when an `.ablx` is installed normally (Developer Mode off), Live launches the extension host with node's permission model enabled. the extension's javascript can only read/write:
+
+- `%LOCALAPPDATA%\Ableton\Extensions` (the installed extension itself)
+- `%LOCALAPPDATA%\Ableton\Extensions Data\gary.gary-extension` (per-extension data)
+- `%LOCALAPPDATA%\Temp\Ableton Extensions`
+
+any other path — your `C:\dev\sa3.cpp\models`, your Downloads folder, anywhere — throws `ERR_ACCESS_DENIED` at the fs layer. that is why there is no "browse for models folder" button: a picked path outside the sandbox would be unreadable anyway. instead, the dialog has **models folder** / **loras folder** reveal buttons that open the sandbox locations in Explorer so you can copy files in.
+
+developer mode (`npm start`) runs the host unsandboxed, so external paths work there. don't be fooled while testing.
+
+### models
+
+press **download** in the dialog to fetch the selected variant (`medium`, `small-music`, `small-sfx`) from Hugging Face into `Extensions Data\gary.gary-extension\models`. variants that are fully present are marked with a ✓ in the variant dropdown, and the extension auto-selects an available variant on open if the current one is missing.
+
+already have the ggufs? press **models folder** and copy them in. the checker matches files by prefix/suffix glob (e.g. `stable-audio-3-medium-dit-*-F16.gguf`), so upstream version bumps in filenames are fine.
+
+### loras
+
+loras are base-model specific, so they live under a **variant subfolder** and are only listed when that variant is selected. the reveal button is labelled for the current variant (e.g. **loras/medium folder**) and opens exactly the right place. drop each lora in as its own subfolder, the way a training run leaves it:
+
+```text
+loras/
+  medium/
+    kev/
+      kev.safetensors    <- required
+      kev.json           <- required (adapter metadata)
+      *.txt              <- optional: one caption per file, feeds the dice button
+    keygen/
+      ...
+  small-music/
+    <loras trained on small-music>
+```
+
+so a `medium` lora is not offered while `small-music` is selected, and vice versa. detection is automatic — no import step. the first time a lora is used for generation it is converted to gguf next to its safetensors (`kev/kev-f32.gguf`) and reused after that (reconverted if the safetensors is newer). a plain `lora-<name>-f32.gguf` dropped into the variant folder also works.
+
+the `.txt` files are the captions from your training dataset. when a lora is active, the **dice** button rolls prompts from those captions instead of the generic pool. no txt files means dice falls back to the built-in generic pool and reports the lora pool as missing.
+
+prefix a lora folder with `_` or `.` to disable it without deleting it.
+
+a future idea is a hugging face lora registry with a "download loras" button; for now, copy folders in by hand.
+
 ## ableton beta sequence
 
 ### easiest install
@@ -76,7 +148,7 @@ this is the path if you just want to use the extension:
 
 1. Download the Ableton Live beta from:
    https://ableton.github.io/extensions-sdk/
-2. Download [gary-extension.ablx](releases/gary-extension.ablx) from this repo.
+2. Download the latest `.ablx` from [Releases](https://github.com/betweentwomidnights/sa3-ableton-extension/releases).
 3. Open Ableton Live beta.
 4. In Preferences -> Extensions, make sure Developer Mode is disabled.
 5. Install the `.ablx` extension from Live's extension UI.

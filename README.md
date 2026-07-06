@@ -80,9 +80,16 @@ the addon itself is backend-agnostic — it `LoadLibrary`s `sa3.dll` at runtime,
 | --- | --- | --- | --- | --- |
 | cuda   | `npm run package:cuda`   | `ggml-cuda` + CUDA runtime (`cublas*`, `cudart*`) | ~600 MB | fastest on NVIDIA; huge because of the CUDA runtime |
 | vulkan | `npm run package:vulkan` | `ggml-vulkan` | ~15 MB | runs on any Vulkan GPU (NVIDIA/AMD/Intel); needs the system Vulkan loader (`vulkan-1.dll`, ships with GPU drivers). basically as fast as CUDA for this workload |
-| cpu    | `npm run package:cpu`    | `ggml-cpu-*` micro-arch variants | ~3 MB | no GPU needed; picks the best AVX level at runtime. slow for `medium`, genuinely usable for `small-music` |
+| cpu    | `npm run package:cpu`    | static `ggml-cpu` | ~3 MB | no GPU needed. slow for `medium`, genuinely usable for `small-music` |
 
-`npm run package:all` builds all three in one pass (compiling the addon once). outputs land in `dist/gary-extension-<backend>.ablx` (also copied into the gitignored `releases/`). the backend is selected at build time with `GARY_SA3_BACKEND=cuda|vulkan|cpu`, mapping to the `sa3.cpp/build-cuda`, `build-vulkan`, and `build-cpu-variants` runtime dirs respectively.
+`npm run package:all` builds all three in one pass (compiling the addon once). outputs land in `dist/gary-extension-<backend>.ablx` (also copied into the gitignored `releases/`). the backend is selected at build time with `GARY_SA3_BACKEND=cuda|vulkan|cpu`, mapping to the `sa3.cpp/build-cuda`, `build-vulkan`, and `build` runtime dirs respectively.
+
+> the CPU build uses the plain static `build/` (where `ggml-cpu.dll` is a direct
+> dependency and loads from the addon dir). the `build-cpu-variants` tree
+> (`GGML_BACKEND_DL` runtime CPU-variant selection) is **CLI-only** — its
+> `ggml-cpu-*.dll` are discovered from the process dir, which the extension host
+> can't satisfy, so it aborts when embedded. keep it for `sa3-generate`
+> benchmarking, not for packaging.
 
 note: all three share the extension id `gary.gary-extension`, so only one can be installed at a time — installing a second replaces the first.
 

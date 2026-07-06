@@ -53,10 +53,14 @@ function copyGlob(dir, pattern, destDir, required = true) {
 // GARY_SA3_BACKEND selects which sa3.cpp build supplies the runtime DLLs.
 // The compiled addon is backend-agnostic (it LoadLibrary's sa3.dll at runtime),
 // so only the bundled DLL set differs between backends.
+// cpu -> the plain static build (ggml-cpu.dll is a direct dependency, so it loads
+// from the addon dir when embedded). build-cpu-variants uses GGML_BACKEND_DL and
+// discovers ggml-cpu-*.dll from the process dir, which fails inside the extension
+// host; it stays a CLI-only benchmarking build.
 const BACKEND_DIRS = {
   cuda: "build-cuda",
   vulkan: "build-vulkan",
-  cpu: "build-cpu-variants",
+  cpu: "build",
 };
 
 function selectedBackend() {

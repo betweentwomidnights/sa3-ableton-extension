@@ -11,16 +11,37 @@ import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 import transformDialog from "./transform-dialog.html";
+import {
+  EMBEDDED_SA3_URL,
+  availableEmbeddedVariants,
+  cancelEmbeddedModelDownload,
+  defaultEmbeddedLorasDir,
+  defaultEmbeddedModelsDir,
+  embeddedDicePrompts,
+  embeddedDownloadStatus,
+  embeddedEffectiveDirs,
+  embeddedModelStatus,
+  embeddedSa3Diagnostics,
+  isEmbeddedBackendUrl,
+  listEmbeddedLoras,
+  runEmbeddedSa3,
+  startEmbeddedModelDownload,
+  type EmbeddedModelOptions,
+  type EmbeddedModelStatus,
+  type EmbeddedSa3Request,
+} from "./embedded-sa3.js";
 
 const API_VERSION = "1.0.0";
 const COMMAND_TRANSFORM_SELECTION = "gary.sa3.transformSelection";
 const COMMAND_CONTINUE_SELECTION = "gary.sa3.continueSelection";
 const COMMAND_GENERATE_SELECTION = "gary.sa3.generateSelection";
 const DEFAULT_LOCAL_SA3_URL = "http://localhost:8006";
+const DEFAULT_BACKEND_URL = EMBEDDED_SA3_URL;
 const SA3_CPP_TAIL_PAD_SECONDS = 6.0;
 let warnedMissingStorageDirectory = false;
 let warnedSettingsWriteFailure = false;
@@ -31,6 +52,11 @@ type SelectionOperation = "transform" | "continue" | "generate";
 
 interface TransformSettings {
   backendUrl: string;
+  embeddedModelsDir: string;
+  embeddedLorasDir: string;
+  embeddedVariant: string;
+  embeddedEncoding: string;
+  embeddedDevice: string;
   prompt: string;
   strength: number;
   steps: number;
@@ -63,6 +89,8 @@ interface DialogInitial extends TransformSettings {
   tempoLabel: string;
   keyScaleLabel: string;
   localBackendUrl: string;
+  embeddedBackendUrl: string;
+  embeddedModelStatus: EmbeddedModelStatus;
   availableLoras: string[];
   statusMessage: string;
 }
@@ -112,7 +140,12 @@ class BackendHttpError extends Error {
 }
 
 const defaultSettings: TransformSettings = {
-  backendUrl: DEFAULT_LOCAL_SA3_URL,
+  backendUrl: DEFAULT_BACKEND_URL,
+  embeddedModelsDir: "",
+  embeddedLorasDir: "",
+  embeddedVariant: "medium",
+  embeddedEncoding: "f16",
+  embeddedDevice: "auto",
   prompt: "",
   strength: 0.9,
   steps: 8,
@@ -213,10 +246,10 @@ async function processSelection(
   const storedSettings = await readStoredSettings(context);
   const musicContext = getMusicContext(context);
   const selectionBeats = endBeat - startBeat;
-  let settings = sanitizeSettings({
+  let settings = settingsWithEmbeddedDefaults(context, sanitizeSettings({
     ...defaultSettings,
     ...storedSettings,
-  });
+  }));
   const initialSettings = settings;
   if (operation === "continue" && settings.continueBeats <= 0) {
     settings = {
@@ -224,7 +257,7 @@ async function processSelection(
       continueBeats: clamp(selectionBeats, 0.25, 1024),
     };
   }
-  let loraNames = await fetchAvailableLoras(settings.backendUrl);
+  let loraNames = await fetchAvailableLoras(settings.backendUrl, embeddedOptionsFromSettings(settings));
   let statusMessage = loraStatusMessage(loraNames);
   const selectionLabel = `${tracks.length} track${tracks.length === 1 ? "" : "s"} / ${formatBeatBarDuration(selectionBeats, musicContext.beatsPerBar)}`;
 
@@ -242,13 +275,13 @@ async function processSelection(
     if (dialogResult.settings) {
       await writeStoredSettings(
         context,
-        settingsForStorage(initialSettings, sanitizeSettings(dialogResult.settings), operation),
+        settingsForStorage(initialSettings, settingsWithEmbeddedDefaults(context, sanitizeSettings(dialogResult.settings)), operation),
       );
     }
     return;
   }
 
-  settings = sanitizeSettings(dialogResult.settings);
+  settings = settingsWithEmbeddedDefaults(context, sanitizeSettings(dialogResult.settings));
   if (operation === "continue" && settings.continueBeats <= 0) {
     settings = {
       ...settings,
@@ -394,6 +427,8 @@ async function runTransformDialog(
       tempoLabel: `${Math.round(initial.musicContext.tempo)} bpm`,
       keyScaleLabel: initial.musicContext.keyScale || "scale off",
       localBackendUrl: DEFAULT_LOCAL_SA3_URL,
+      embeddedBackendUrl: EMBEDDED_SA3_URL,
+      embeddedModelStatus: embeddedModelStatus(embeddedOptionsFromSettings(settings)),
       availableLoras: mergeLoraNames(loraNames, settings.loras.map((lora) => lora.name)),
       statusMessage,
     });
@@ -408,7 +443,7 @@ async function runTransformDialog(
     }
 
     if (result.settings) {
-      settings = sanitizeSettings(result.settings);
+      settings = settingsWithEmbeddedDefaults(context, sanitizeSettings(result.settings));
       await writeStoredSettings(
         context,
         settingsForStorage(initial.settings, settings, initial.operation),
@@ -416,7 +451,7 @@ async function runTransformDialog(
     }
 
     if (result.action === "refresh-loras") {
-      loraNames = await fetchAvailableLoras(settings.backendUrl);
+      loraNames = await fetchAvailableLoras(settings.backendUrl, embeddedOptionsFromSettings(settings));
       statusMessage = loraStatusMessage(loraNames);
       await writeStoredSettings(
         context,
@@ -430,6 +465,7 @@ async function runTransformDialog(
         const dice = await fetchDicePrompt(
           settings.backendUrl,
           settings.loras.map((lora) => lora.name),
+          embeddedOptionsFromSettings(settings),
         );
         settings = {
           ...settings,
@@ -468,7 +504,7 @@ async function showTransformDialog(
   });
 
   try {
-    const result = await context.ui.showModalDialog(server.url, 620, 500);
+    const result = await context.ui.showModalDialog(server.url, 680, 560);
     const dialogResult = JSON.parse(result) as DialogResult;
     if (dialogResult.settings) {
       storedSettings = settingsForStorage(storedSettings, sanitizeSettings(dialogResult.settings), initial.operation);
@@ -574,6 +610,26 @@ async function submitAndDownloadTransform(
   const prompt = composePrompt(settings.prompt, musicContext);
   const baseUrl = normalizeBaseUrl(settings.backendUrl);
 
+  if (isEmbeddedBackendUrl(baseUrl)) {
+    console.log("[gary-sa3] embedded SA3 transform selected");
+    const outputPath = await outputWavPath(context, "transform", path.dirname(sourceWavPath));
+    const transformed = await runEmbeddedSa3(
+      embeddedSa3Request(settings, prompt, durationSeconds, {
+        operation: "transform",
+        initPath: sourceWavPath,
+        initNoiseLevel: settings.strength,
+        durationPaddingSec: 0.0,
+      }),
+      outputPath,
+      update,
+      signal,
+    );
+    if (transformed.seed) {
+      console.log(`[gary-sa3] embedded transform seed ${transformed.seed}`);
+    }
+    return transformed;
+  }
+
   let sessionId: string;
   const useInitPath = await shouldPreferSa3CppInitPath(baseUrl, signal);
   if (useInitPath) {
@@ -647,6 +703,26 @@ async function submitAndDownloadGenerate(
 
   const prompt = composePrompt(settings.prompt, musicContext);
   const baseUrl = normalizeBaseUrl(settings.backendUrl);
+
+  if (isEmbeddedBackendUrl(baseUrl)) {
+    console.log(
+      `[gary-sa3] embedded SA3 generate selected duration=${durationSeconds.toFixed(3)} steps=${settings.steps} loras=${settings.loras.length}`,
+    );
+    const outputPath = await outputWavPath(context, "generate");
+    const generated = await runEmbeddedSa3(
+      embeddedSa3Request(settings, prompt, durationSeconds, {
+        operation: "generate",
+      }),
+      outputPath,
+      update,
+      signal,
+    );
+    if (generated.seed) {
+      console.log(`[gary-sa3] embedded generate seed ${generated.seed}`);
+    }
+    return generated;
+  }
+
   const request = {
     ...legacySa3Request(settings, prompt),
     ...sa3CppRequest(settings, prompt, durationSeconds),
@@ -696,6 +772,30 @@ async function submitAndDownloadContinue(
   const totalDurationSeconds = sourceDurationSeconds + continuationSeconds;
   const sa3CppGenDurationSeconds = totalDurationSeconds + SA3_CPP_TAIL_PAD_SECONDS;
   const targetSamples = durationToSamples(totalDurationSeconds);
+
+  if (isEmbeddedBackendUrl(baseUrl)) {
+    console.log(
+      `[gary-sa3] embedded SA3 continue selected source=${sourceDurationSeconds.toFixed(3)}s add=${continuationSeconds.toFixed(3)}s total=${totalDurationSeconds.toFixed(3)}s gen=${sa3CppGenDurationSeconds.toFixed(3)}s target_samples=${targetSamples}`,
+    );
+    const outputPath = await outputWavPath(context, "continue", path.dirname(sourceWavPath));
+    const continued = await runEmbeddedSa3(
+      embeddedSa3Request(settings, prompt, sa3CppGenDurationSeconds, {
+        operation: "continue",
+        targetSamples,
+        initPath: sourceWavPath,
+        inpaintStart: Number(sourceDurationSeconds.toFixed(3)),
+        inpaintEnd: Number(sa3CppGenDurationSeconds.toFixed(3)),
+        durationPaddingSec: 0.0,
+      }),
+      outputPath,
+      update,
+      signal,
+    );
+    if (continued.seed) {
+      console.log(`[gary-sa3] embedded continue seed ${continued.seed}`);
+    }
+    return continued;
+  }
 
   let sessionId: string;
   const useInitPath = await shouldPreferSa3CppInitPath(baseUrl, signal);
@@ -807,6 +907,42 @@ function sa3CppRequest(
   };
 }
 
+function embeddedSa3Request(
+  settings: TransformSettings,
+  prompt: string,
+  durationSeconds: number,
+  overrides: Partial<EmbeddedSa3Request> & Pick<EmbeddedSa3Request, "operation">,
+): EmbeddedSa3Request {
+  const targetSamples = overrides.targetSamples ?? durationToSamples(durationSeconds);
+  return {
+    operation: overrides.operation,
+    ...embeddedOptionsFromSettings(settings),
+    device: settings.embeddedDevice,
+    prompt,
+    negativePrompt: settings.negativePrompt,
+    durationSeconds,
+    targetSamples,
+    durationPaddingSec: overrides.durationPaddingSec ?? SA3_CPP_TAIL_PAD_SECONDS,
+    steps: settings.steps,
+    cfgScale: settings.cfgScale,
+    distShift: sa3CppDistShift(settings.shift),
+    seed: settings.useSeed ? settings.seed : -1,
+    keepModels: false,
+    loras: settings.loras.map((lora) => ({
+      name: lora.name,
+      strength: lora.strength,
+    })),
+    initPath: overrides.initPath,
+    initNoiseLevel: overrides.initNoiseLevel,
+    inpaintStart: overrides.inpaintStart,
+    inpaintEnd: overrides.inpaintEnd,
+    encodeChunkSize: 128,
+    encodeOverlap: 32,
+    decodeChunkSize: 128,
+    decodeOverlap: 32,
+  };
+}
+
 function sa3CppDistShift(shift: string): string {
   switch (shift.toLowerCase()) {
     case "none":
@@ -850,16 +986,24 @@ async function writeOutputWav(
   audioData: string,
   fallbackDirectory?: string,
 ): Promise<string> {
+  const outputPath = await outputWavPath(context, operation, fallbackDirectory);
+  await fs.writeFile(outputPath, Buffer.from(audioData, "base64"));
+  console.log(`[gary-sa3] wrote ${operation} wav: ${outputPath}`);
+  return outputPath;
+}
+
+async function outputWavPath(
+  context: Context,
+  operation: SelectionOperation,
+  fallbackDirectory?: string,
+): Promise<string> {
   const tempDirectory =
     context.environment.tempDirectory ??
     fallbackDirectory ??
     path.join(os.tmpdir(), "gary-sa3-ableton");
   await fs.mkdir(tempDirectory, { recursive: true });
 
-  const outputPath = path.join(tempDirectory, `gary-sa3-${operation}-${randomUUID()}.wav`);
-  await fs.writeFile(outputPath, Buffer.from(audioData, "base64"));
-  console.log(`[gary-sa3] wrote ${operation} wav: ${outputPath}`);
-  return outputPath;
+  return path.join(tempDirectory, `gary-sa3-${operation}-${randomUUID()}.wav`);
 }
 
 async function shouldPreferSa3CppInitPath(baseUrl: string, signal: AbortSignal): Promise<boolean> {
@@ -957,9 +1101,10 @@ async function startDialogServer(
 ): Promise<{ url: string; close: () => Promise<void> }> {
   const server = http.createServer((request, response) => {
     void handleDialogRequest(html, options, request, response).catch((error) => {
+      console.error(`[gary-sa3] dialog bridge failed ${request.method || ""} ${request.url || ""}`, error);
       sendJson(response, 500, {
         success: false,
-        error: error instanceof Error ? error.message : "dialog bridge failed",
+        error: errorToMessage(error),
       });
     });
   });
@@ -1013,6 +1158,35 @@ async function handleDialogRequest(
     return;
   }
 
+  if (route.path === "/api/embedded/models/download" && request.method === "POST") {
+    const payload = asRecord(await readJsonBody(request));
+    const status = await startEmbeddedModelDownload(embeddedOptionsFromRecord(payload));
+    sendJson(response, 200, { success: true, ...status });
+    return;
+  }
+
+  if (route.path === "/api/embedded/models/cancel" && request.method === "POST") {
+    const status = cancelEmbeddedModelDownload();
+    sendJson(response, 200, { success: true, ...status });
+    return;
+  }
+
+  if (route.path === "/api/embedded/models/reveal" && request.method === "POST") {
+    const payload = asRecord(await readJsonBody(request));
+    const directory = embeddedEffectiveDirs(embeddedOptionsFromRecord(payload)).modelsDir;
+    await revealDirectory(directory);
+    sendJson(response, 200, { success: true, path: directory });
+    return;
+  }
+
+  if (route.path === "/api/embedded/loras/reveal" && request.method === "POST") {
+    const payload = asRecord(await readJsonBody(request));
+    const directory = embeddedEffectiveDirs(embeddedOptionsFromRecord(payload)).lorasVariantDir;
+    await revealDirectory(directory);
+    sendJson(response, 200, { success: true, path: directory });
+    return;
+  }
+
   if (request.method !== "GET") {
     sendJson(response, 405, { success: false, error: "method not allowed" });
     return;
@@ -1028,18 +1202,18 @@ async function handleDialogRequest(
   }
 
   if (route.path === "/api/prompts") {
-    const backendUrl = route.query.backendUrl || DEFAULT_LOCAL_SA3_URL;
+    const backendUrl = route.query.backendUrl || DEFAULT_BACKEND_URL;
     const loras = route.query.lora
       ? route.query.lora.split(",").map((name) => name.trim()).filter(Boolean)
       : [];
-    const dice = await fetchDicePrompt(backendUrl, loras);
+    const dice = await fetchDicePrompt(backendUrl, loras, embeddedOptionsFromRecord(route.query));
     sendJson(response, 200, { success: true, ...dice });
     return;
   }
 
   if (route.path === "/api/loras") {
-    const backendUrl = route.query.backendUrl || DEFAULT_LOCAL_SA3_URL;
-    const loras = await fetchAvailableLoras(backendUrl);
+    const backendUrl = route.query.backendUrl || DEFAULT_BACKEND_URL;
+    const loras = await fetchAvailableLoras(backendUrl, embeddedOptionsFromRecord(route.query));
     sendJson(response, 200, {
       success: true,
       loras,
@@ -1049,9 +1223,21 @@ async function handleDialogRequest(
   }
 
   if (route.path === "/api/health") {
-    const backendUrl = route.query.backendUrl || DEFAULT_LOCAL_SA3_URL;
-    const health = await checkBackendHealth(backendUrl);
+    const backendUrl = route.query.backendUrl || DEFAULT_BACKEND_URL;
+    const health = await checkBackendHealth(backendUrl, embeddedOptionsFromRecord(route.query));
     sendJson(response, 200, { success: true, ...health });
+    return;
+  }
+
+  if (route.path === "/api/embedded/models/status") {
+    const options = embeddedOptionsFromRecord(route.query);
+    sendJson(response, 200, {
+      success: true,
+      ...embeddedModelStatus(options),
+      download: embeddedDownloadStatus(options),
+      variants: availableEmbeddedVariants(options),
+      dirs: embeddedEffectiveDirs(options),
+    });
     return;
   }
 
@@ -1087,7 +1273,29 @@ async function fetchJsonWithTimeout<T = unknown>(url: string, timeoutMs: number)
   }
 }
 
-async function checkBackendHealth(backendUrl: string): Promise<BackendHealth> {
+async function revealDirectory(directory: string): Promise<void> {
+  if (!directory) {
+    throw new Error("no directory to reveal");
+  }
+
+  await fs.mkdir(directory, { recursive: true });
+  const opener = process.platform === "win32"
+    ? "explorer.exe"
+    : process.platform === "darwin"
+      ? "open"
+      : "xdg-open";
+  // explorer.exe reports a nonzero exit code even on success, so fire and forget.
+  execFile(opener, [directory], () => {});
+}
+
+async function checkBackendHealth(
+  backendUrl: string,
+  embeddedOptions: EmbeddedModelOptions = {},
+): Promise<BackendHealth> {
+  if (isEmbeddedBackendUrl(backendUrl)) {
+    return embeddedSa3Diagnostics(embeddedOptions);
+  }
+
   try {
     const response = await fetchJsonWithTimeout<unknown>(`${normalizeBaseUrl(backendUrl)}/health`, 2500);
     if (healthResponseLooksOnline(response)) {
@@ -1101,7 +1309,14 @@ async function checkBackendHealth(backendUrl: string): Promise<BackendHealth> {
   }
 }
 
-async function fetchAvailableLoras(backendUrl: string): Promise<string[]> {
+async function fetchAvailableLoras(
+  backendUrl: string,
+  embeddedOptions: EmbeddedModelOptions = {},
+): Promise<string[]> {
+  if (isEmbeddedBackendUrl(backendUrl)) {
+    return listEmbeddedLoras(embeddedOptions);
+  }
+
   try {
     const response = await fetchJsonWithTimeout<unknown>(`${normalizeBaseUrl(backendUrl)}/loras`, 8000);
     return parseLoraNames(response);
@@ -1114,7 +1329,17 @@ async function fetchAvailableLoras(backendUrl: string): Promise<string[]> {
 async function fetchDicePrompt(
   backendUrl: string,
   activeLoraNames: string[],
+  embeddedOptions: EmbeddedModelOptions = {},
 ): Promise<DicePromptResult> {
+  if (isEmbeddedBackendUrl(backendUrl)) {
+    const dice = await embeddedDicePrompts(activeLoraNames, embeddedOptions);
+    return pickDicePrompt({
+      success: true,
+      prompts: dice.prompts,
+      missing_loras: dice.missingLoras,
+    });
+  }
+
   const baseUrl = normalizeBaseUrl(backendUrl);
   const loraQuery = uniqueStrings(activeLoraNames.map((name) => name.trim()).filter(Boolean));
   const url = appendQuery(`${baseUrl}/prompts`, loraQuery.length > 0
@@ -1128,7 +1353,14 @@ async function fetchDicePrompt(
 function sanitizeSettings(settings: TransformSettings): TransformSettings {
   const seed = Number.isFinite(Number(settings.seed)) ? Math.trunc(Number(settings.seed)) : -1;
   return {
-    backendUrl: normalizeBaseUrl(settings.backendUrl || DEFAULT_LOCAL_SA3_URL),
+    backendUrl: normalizeBaseUrl(settings.backendUrl || DEFAULT_BACKEND_URL),
+    embeddedModelsDir: typeof settings.embeddedModelsDir === "string" ? settings.embeddedModelsDir.trim() : "",
+    embeddedLorasDir: typeof settings.embeddedLorasDir === "string" ? settings.embeddedLorasDir.trim() : "",
+    embeddedVariant: ["medium", "small-music", "small-sfx"].includes(settings.embeddedVariant)
+      ? settings.embeddedVariant
+      : "medium",
+    embeddedEncoding: String(settings.embeddedEncoding || "").trim().toLowerCase() === "f32" ? "f32" : "f16",
+    embeddedDevice: String(settings.embeddedDevice || "").trim().toLowerCase() === "cpu" ? "cpu" : "auto",
     prompt: settings.prompt.trim(),
     strength: clamp(Number(settings.strength), 0.01, 1.0),
     steps: Math.round(clamp(Number(settings.steps), 4, 16)),
@@ -1144,6 +1376,37 @@ function sanitizeSettings(settings: TransformSettings): TransformSettings {
     continueBeats: clamp(Number(settings.continueBeats), 0, 1024),
     loras: sanitizeLoras(settings.loras),
   };
+}
+
+function settingsWithEmbeddedDefaults(context: Context, settings: TransformSettings): TransformSettings {
+  return sanitizeSettings({
+    ...settings,
+    embeddedModelsDir: settings.embeddedModelsDir || defaultEmbeddedModelsDir(context.environment.storageDirectory),
+    embeddedLorasDir: settings.embeddedLorasDir || defaultEmbeddedLorasDir(context.environment.storageDirectory),
+  });
+}
+
+function embeddedOptionsFromSettings(settings: TransformSettings): EmbeddedModelOptions {
+  return {
+    modelsDir: settings.embeddedModelsDir,
+    adaptersDir: settings.embeddedLorasDir,
+    variant: settings.embeddedVariant,
+    encoding: settings.embeddedEncoding,
+  };
+}
+
+function embeddedOptionsFromRecord(record: Record<string, unknown> | undefined): EmbeddedModelOptions {
+  return {
+    modelsDir: stringField(record, "modelsDir") || stringField(record, "embeddedModelsDir"),
+    adaptersDir: stringField(record, "adaptersDir") || stringField(record, "embeddedLorasDir"),
+    variant: stringField(record, "variant") || stringField(record, "embeddedVariant"),
+    encoding: stringField(record, "encoding") || stringField(record, "embeddedEncoding"),
+  };
+}
+
+function stringField(record: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" ? value.trim() : undefined;
 }
 
 function settingsForStorage(
@@ -1370,7 +1633,7 @@ function formatBeatBarDuration(beats: number, beatsPerBar: number): string {
 }
 
 function normalizeBaseUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "") || DEFAULT_LOCAL_SA3_URL;
+  return url.trim().replace(/\/+$/, "") || DEFAULT_BACKEND_URL;
 }
 
 function appendQuery(url: string, params: Record<string, string>): string {

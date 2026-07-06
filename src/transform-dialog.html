@@ -8,11 +8,13 @@
     const initial = __INITIAL_JSON__;
     let availableLoras = initial.availableLoras || [];
     const localBackendUrl = initial.localBackendUrl;
+    const embeddedBackendUrl = initial.embeddedBackendUrl;
     const isWebKitMessageHandlerAvailable = window.webkit &&
       window.webkit.messageHandlers &&
       window.webkit.messageHandlers.live;
     const isWebView2 = window.chrome && window.chrome.webview;
     let saveTimer = 0;
+    let modelPollTimer = 0;
 
     function sendMessage(message) {
       if (isWebKitMessageHandlerAvailable) {
@@ -42,6 +44,11 @@
       const continueBars = Number(value("continueBars"));
       return {
         backendUrl: value("backendUrl"),
+        embeddedModelsDir: value("embeddedModelsDir"),
+        embeddedLorasDir: value("embeddedLorasDir"),
+        embeddedVariant: value("embeddedVariant"),
+        embeddedEncoding: value("embeddedEncoding"),
+        embeddedDevice: value("embeddedDevice"),
         prompt: value("prompt"),
         strength: Number(value("strength")),
         steps: Number(value("steps")),
@@ -121,6 +128,9 @@
 
     function backendMode() {
       const current = normalizeUrl(value("backendUrl"));
+      if (current === normalizeUrl(embeddedBackendUrl)) {
+        return "embedded";
+      }
       if (current === normalizeUrl(localBackendUrl)) {
         return "local";
       }
@@ -129,19 +139,25 @@
 
     function updateBackendModeUi() {
       const mode = backendMode();
-      el("backendToggle").textContent = mode === "local" ? "local" : "custom";
+      el("backendToggle").textContent = mode;
       el("backendToggle").title = mode === "local"
-        ? "using localhost SA3 backend"
-        : "reset to localhost SA3 backend";
+        ? "switch to embedded SA3"
+        : mode === "embedded"
+          ? "switch to localhost SA3 backend"
+        : "switch to embedded SA3";
+      el("embeddedPanel").hidden = mode !== "embedded";
     }
 
-    function resetBackendToLocal() {
-      el("backendUrl").value = localBackendUrl;
+    function toggleBackendMode() {
+      el("backendUrl").value = backendMode() === "embedded" ? localBackendUrl : embeddedBackendUrl;
       updateBackendModeUi();
       persistSettingsSoon();
       setHealth("checking...", "pending");
       void checkBackendHealth();
       void refreshLorasInPlace();
+      if (backendMode() === "embedded") {
+        void checkEmbeddedModels();
+      }
     }
 
     function setHealth(text, state) {
@@ -171,6 +187,220 @@
       }
     }
 
+    async function postJsonWithTimeout(url, body, timeoutMs) {
+      const controller = timeoutMs > 0 ? new AbortController() : null;
+      const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : 0;
+
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          signal: controller ? controller.signal : undefined,
+          headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(body || {})
+        });
+        const text = await response.text();
+        const json = text.trim() ? JSON.parse(text) : {};
+        if (!response.ok) {
+          throw new Error(errorFromResponse(json, `HTTP ${response.status}`));
+        }
+        return json;
+      } finally {
+        if (timeout) {
+          clearTimeout(timeout);
+        }
+      }
+    }
+
+    function embeddedOptions() {
+      return {
+        modelsDir: value("embeddedModelsDir"),
+        adaptersDir: value("embeddedLorasDir"),
+        variant: value("embeddedVariant"),
+        encoding: value("embeddedEncoding")
+      };
+    }
+
+    function backendQueryParams() {
+      return {
+        backendUrl: value("backendUrl"),
+        ...(backendMode() === "embedded" ? embeddedOptions() : {})
+      };
+    }
+
+    function setEmbeddedModelStatus(text, state) {
+      const node = el("embeddedModelsStatus");
+      node.textContent = text || "";
+      node.dataset.state = state || "";
+    }
+
+    function renderEmbeddedModelStatus(status) {
+      const download = status && status.download && status.download.active ? status.download : status;
+      const active = Boolean(download && download.active);
+      const button = el("embeddedModelsDownload");
+      button.dataset.active = active ? "true" : "false";
+      button.textContent = active ? "cancel" : "download";
+
+      if (!download) {
+        setEmbeddedModelStatus("not checked", "");
+        return;
+      }
+
+      if (download.error) {
+        setEmbeddedModelStatus(download.error, "offline");
+        return;
+      }
+
+      if (active) {
+        const pct = Math.round(Number(download.progress || 0) * 100);
+        setEmbeddedModelStatus(`${pct}% ${download.label || "downloading"}`, "pending");
+        return;
+      }
+
+      if (download.complete) {
+        setEmbeddedModelStatus(`${download.variant || value("embeddedVariant")} ${download.encoding || value("embeddedEncoding")} ready`, "online");
+        return;
+      }
+
+      const missing = Array.isArray(download.missing) && download.missing.length > 0
+        ? download.missing.join(", ")
+        : "models";
+      setEmbeddedModelStatus(`missing ${missing}`, "offline");
+    }
+
+    async function checkEmbeddedModels() {
+      if (backendMode() !== "embedded") {
+        return;
+      }
+
+      try {
+        const json = await fetchJsonWithTimeout(appendQuery("/api/embedded/models/status", embeddedOptions()), 8000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, "model check failed"));
+        }
+        renderEmbeddedModelStatus(json);
+        applyEmbeddedDetection(json);
+        if (json.download && json.download.active) {
+          scheduleEmbeddedModelPoll();
+        }
+      } catch (error) {
+        setEmbeddedModelStatus("model check failed", "offline");
+      }
+    }
+
+    function scheduleEmbeddedModelPoll() {
+      clearTimeout(modelPollTimer);
+      modelPollTimer = setTimeout(() => {
+        void pollEmbeddedModels();
+      }, 1000);
+    }
+
+    async function pollEmbeddedModels() {
+      if (backendMode() !== "embedded") {
+        return;
+      }
+
+      try {
+        const json = await fetchJsonWithTimeout(appendQuery("/api/embedded/models/status", embeddedOptions()), 8000);
+        renderEmbeddedModelStatus(json);
+        applyEmbeddedDetection(json);
+        if (json.download && json.download.active) {
+          scheduleEmbeddedModelPoll();
+        } else {
+          void checkBackendHealth();
+          void refreshLorasInPlace();
+        }
+      } catch {
+        scheduleEmbeddedModelPoll();
+      }
+    }
+
+    async function downloadOrCancelEmbeddedModels() {
+      const button = el("embeddedModelsDownload");
+      button.disabled = true;
+
+      try {
+        const active = button.dataset.active === "true";
+        const json = active
+          ? await postJsonWithTimeout("/api/embedded/models/cancel", embeddedOptions(), 8000)
+          : await postJsonWithTimeout("/api/embedded/models/download", embeddedOptions(), 30000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, active ? "cancel failed" : "download failed"));
+        }
+        renderEmbeddedModelStatus(json);
+        if (json.active || !active) {
+          scheduleEmbeddedModelPoll();
+        }
+      } catch (error) {
+        setEmbeddedModelStatus(error instanceof Error ? error.message : "download failed", "offline");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function revealEmbeddedFolder(kind) {
+      const button = el(kind === "models" ? "embeddedModelsReveal" : "embeddedLorasReveal");
+      button.disabled = true;
+
+      try {
+        const json = await postJsonWithTimeout(`/api/embedded/${kind}/reveal`, embeddedOptions(), 15000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, "could not open folder"));
+        }
+        setStatus(`opened ${kind} folder`);
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "could not open folder");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    let autoPickedVariant = false;
+
+    function applyEmbeddedDetection(status) {
+      if (status && status.dirs) {
+        const hint = el("embeddedDirsHint");
+        hint.textContent = status.dirs.modelsDir || "";
+        hint.title = `models: ${status.dirs.modelsDir || "?"}\nloras: ${status.dirs.lorasVariantDir || status.dirs.lorasDir || "?"}`;
+      }
+
+      if (!status || !Array.isArray(status.variants)) {
+        return;
+      }
+
+      const select = el("embeddedVariant");
+      el("embeddedLorasReveal").textContent = `loras/${select.value} folder`;
+      const availability = {};
+      for (const item of status.variants) {
+        availability[item.variant] = Array.isArray(item.encodings) ? item.encodings : [];
+      }
+      for (const option of select.options) {
+        const encodings = availability[option.value] || [];
+        option.textContent = encodings.length > 0 ? `${option.value} ✓` : option.value;
+      }
+
+      const current = availability[select.value] || [];
+      if (current.length > 0 && !current.includes(el("embeddedEncoding").value)) {
+        el("embeddedEncoding").value = current[0];
+        persistSettingsSoon();
+        return;
+      }
+
+      if (current.length === 0 && !autoPickedVariant) {
+        const fallback = status.variants.find((item) => item.encodings.length > 0);
+        if (fallback) {
+          autoPickedVariant = true;
+          select.value = fallback.variant;
+          el("embeddedEncoding").value = fallback.encodings.includes("f16") ? "f16" : fallback.encodings[0];
+          persistSettingsSoon();
+          void checkEmbeddedModels();
+          void refreshLorasInPlace();
+        }
+      }
+    }
+
     async function rollDiceInPlace() {
       const button = el("diceButton");
       button.disabled = true;
@@ -179,7 +409,7 @@
       try {
         const loras = activeLoraNames();
         const url = appendQuery("/api/prompts", {
-          backendUrl: value("backendUrl"),
+          ...backendQueryParams(),
           ...(loras.length > 0 ? { lora: loras.join(",") } : {})
         });
 
@@ -266,9 +496,7 @@
         }
       }
 
-      return await fetchJsonWithTimeout(appendQuery("/api/health", {
-        backendUrl
-      }), 8000);
+      return await fetchJsonWithTimeout(appendQuery("/api/health", backendQueryParams()), 8000);
     }
 
     function renderLoras() {
@@ -346,7 +574,7 @@
 
       try {
         const json = await fetchJsonWithTimeout(appendQuery("/api/loras", {
-          backendUrl: value("backendUrl")
+          ...backendQueryParams()
         }), 8000);
         if (!json.success || !Array.isArray(json.loras)) {
           throw new Error(errorFromResponse(json, "failed to refresh loras"));
@@ -420,6 +648,11 @@
 
     document.addEventListener("DOMContentLoaded", () => {
       el("backendUrl").value = initial.backendUrl;
+      el("embeddedModelsDir").value = initial.embeddedModelsDir || (initial.embeddedModelStatus && initial.embeddedModelStatus.modelsDir) || "";
+      el("embeddedLorasDir").value = initial.embeddedLorasDir || "";
+      el("embeddedVariant").value = initial.embeddedVariant || (initial.embeddedModelStatus && initial.embeddedModelStatus.variant) || "medium";
+      el("embeddedEncoding").value = initial.embeddedEncoding || (initial.embeddedModelStatus && initial.embeddedModelStatus.encoding) || "f16";
+      el("embeddedDevice").value = initial.embeddedDevice === "cpu" ? "cpu" : "auto";
       el("prompt").value = initial.prompt;
       el("strength").value = String(initial.strength);
       el("strengthValue").textContent = Number(initial.strength).toFixed(2);
@@ -436,22 +669,46 @@
       el("selection").textContent = initial.selectionLabel;
       el("music").textContent = [initial.tempoLabel, initial.keyScaleLabel].filter(Boolean).join(" / ");
       setStatus(initial.statusMessage || "");
+      renderEmbeddedModelStatus(initial.embeddedModelStatus);
       configureForOperation();
       updateBackendModeUi();
 
       renderLoras();
       void checkBackendHealth();
+      void checkEmbeddedModels();
 
       el("shell").addEventListener("input", persistSettingsSoon);
       el("shell").addEventListener("change", persistSettingsSoon);
       el("strength").addEventListener("input", (event) => {
         el("strengthValue").textContent = Number(event.target.value).toFixed(2);
       });
-      el("backendToggle").addEventListener("click", resetBackendToLocal);
+      el("backendToggle").addEventListener("click", toggleBackendMode);
       el("backendUrl").addEventListener("change", () => {
         updateBackendModeUi();
         void checkBackendHealth();
         void refreshLorasInPlace();
+        void checkEmbeddedModels();
+      });
+      for (const id of ["embeddedModelsDir", "embeddedLorasDir", "embeddedVariant", "embeddedEncoding"]) {
+        el(id).addEventListener("change", () => {
+          renderEmbeddedModelStatus(null);
+          void checkEmbeddedModels();
+          void checkBackendHealth();
+          void refreshLorasInPlace();
+        });
+      }
+      el("embeddedModelsCheck").addEventListener("click", () => {
+        setEmbeddedModelStatus("checking...", "pending");
+        void checkEmbeddedModels();
+      });
+      el("embeddedModelsReveal").addEventListener("click", () => {
+        void revealEmbeddedFolder("models");
+      });
+      el("embeddedLorasReveal").addEventListener("click", () => {
+        void revealEmbeddedFolder("loras");
+      });
+      el("embeddedModelsDownload").addEventListener("click", () => {
+        void downloadOrCancelEmbeddedModels();
       });
       el("healthCheck").addEventListener("click", () => {
         setHealth("checking...", "pending");
@@ -603,6 +860,50 @@
       min-width: 0;
     }
 
+    .embedded-panel {
+      display: grid;
+      gap: 6px;
+      padding-top: 2px;
+      border-top: 1px solid #242424;
+    }
+
+    .embedded-panel[hidden] {
+      display: none;
+    }
+
+    .embedded-model-row {
+      display: grid;
+      grid-template-columns: 128px 84px 52px 84px minmax(112px, 1fr);
+      align-items: end;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .embedded-lora-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .embedded-lora-row button {
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+
+    .embedded-lora-row .model-status {
+      flex: 1 1 auto;
+    }
+
+    .inline-select {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 4px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
     .health-status {
       min-width: 0;
       color: var(--muted);
@@ -614,6 +915,20 @@
     .health-status[data-state="online"] { color: #8fd484; }
     .health-status[data-state="offline"] { color: #ff7d6e; }
     .health-status[data-state="pending"] { color: var(--accent); }
+
+    .model-status {
+      min-width: 0;
+      height: 22px;
+      line-height: 22px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .model-status[data-state="online"] { color: #8fd484; }
+    .model-status[data-state="offline"] { color: #ff7d6e; }
+    .model-status[data-state="pending"] { color: var(--accent); }
 
     .range-row {
       display: grid;
@@ -779,6 +1094,42 @@
           <div class="health-status" id="healthStatus"></div>
         </div>
       </label>
+      <div class="embedded-panel full" id="embeddedPanel" hidden>
+        <input id="embeddedModelsDir" type="hidden">
+        <input id="embeddedLorasDir" type="hidden">
+        <div class="embedded-model-row">
+          <label>
+            variant
+            <select id="embeddedVariant">
+              <option value="medium">medium</option>
+              <option value="small-music">small-music</option>
+              <option value="small-sfx">small-sfx</option>
+            </select>
+          </label>
+          <label>
+            encoding
+            <select id="embeddedEncoding">
+              <option value="f16">f16</option>
+              <option value="f32">f32</option>
+            </select>
+          </label>
+          <button id="embeddedModelsCheck" type="button">check</button>
+          <button id="embeddedModelsDownload" type="button">download</button>
+          <div class="model-status" id="embeddedModelsStatus"></div>
+        </div>
+        <div class="embedded-lora-row">
+          <label class="inline-select">
+            device
+            <select id="embeddedDevice" title="auto uses the GPU when the build has one; cpu forces CPU">
+              <option value="auto">auto</option>
+              <option value="cpu">cpu</option>
+            </select>
+          </label>
+          <button id="embeddedModelsReveal" type="button">models folder</button>
+          <button id="embeddedLorasReveal" type="button">loras folder</button>
+          <div class="model-status" id="embeddedDirsHint"></div>
+        </div>
+      </div>
       <label class="full">
         prompt
         <div class="prompt-row">

@@ -1,4 +1,5 @@
 node_modules/
+build/
 dist/
 .env
 .ableton-storage/
@@ -8,6 +9,7 @@ dist/
 *-stderr.txt
 PUBLIC_RELEASE_PLAN.md
 vendor/*.tgz
+releases/*.ablx
 backend/outputs/
 backend/loras/
 backend/lora_registry.json

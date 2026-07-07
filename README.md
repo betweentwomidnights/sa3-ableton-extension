@@ -93,6 +93,15 @@ the addon itself is backend-agnostic — it `LoadLibrary`s `sa3.dll` at runtime,
 
 note: all three share the extension id `gary.gary-extension`, so only one can be installed at a time — installing a second replaces the first.
 
+> performance is variable, especially on vulkan. the vulkan backend compiles
+> compute shaders on first use, so the *first* init-audio transform/continue
+> after install can take several extra seconds while pipelines build and get
+> cached by the GPU driver; later runs are fast. speed also depends on power
+> state (keep the laptop plugged in — battery throttles the GPU hard) and on
+> GPU contention from screen capture/encoding (e.g. OBS). for init-audio-heavy
+> work on NVIDIA, the cuda build is the most consistent. this is all still
+> experimental.
+
 ### device toggle (auto / cpu)
 
 the dialog's embedded panel has a **device** dropdown:

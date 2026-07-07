@@ -2,7 +2,15 @@
 
 stable audio 3 generation, transformation, and continuation directly inside Ableton Live arrangement selections.
 
-**UPDATE:** oops, i misunderstood how easy it was to use just the `.ablx` file if you disable developer mode. if you only want to use the extension, grab the latest `.ablx` from [Releases](https://github.com/betweentwomidnights/sa3-ableton-extension/releases) and install it inside Ableton Live beta with Developer Mode off.
+> ## ⚗️ experimental branch — embedded sa3.cpp
+>
+> **this is the experimental branch where we embed [sa3.cpp](https://github.com/betweentwomidnights/sa3.cpp) directly into the extension** — no separate backend process. still iterating; **not merging into `main` just yet.**
+>
+> **downloads (v0.1.0, experimental):** [cuda ~575 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-cuda.ablx) · [vulkan ~15 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-vulkan.ablx) · [cpu ~1 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-cpu.ablx) · [all releases](https://github.com/betweentwomidnights/sa3-ableton-extension/releases)
+>
+> everything should theoretically still work if you switch to http requests and `local` mode, but right now we're busy testing the different sa3.cpp builds (CUDA, VULKAN, and — very shortly — Metal) to see what breaks.
+>
+> install with Developer Mode **off** in Ableton Live beta.
 
 fair warning...you still need an SA3 backend while generating, either Gary4local or the backend in this repo. but you do not need to run the Ableton extension host from a terminal unless you're building on top of this.
 

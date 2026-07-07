@@ -6,7 +6,7 @@ stable audio 3 generation, transformation, and continuation directly inside Able
 >
 > **this is the experimental branch where we embed [sa3.cpp](https://github.com/betweentwomidnights/sa3.cpp) directly into the extension** — no separate backend process. still iterating; **not merging into `main` just yet.**
 >
-> **downloads (v0.1.0, experimental):** [cuda ~575 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-cuda.ablx) · [vulkan ~15 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-vulkan.ablx) · [cpu ~1 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-cpu.ablx) · [all releases](https://github.com/betweentwomidnights/sa3-ableton-extension/releases)
+> **downloads (v0.1.0, experimental):** [cuda ~575 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-cuda.ablx) · [vulkan ~15 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-vulkan.ablx) · [cpu ~1 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-cpu.ablx) · [mac ~15 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0-metal/gary-extension-metal.ablx)
 >
 > everything should theoretically still work if you switch to http requests and `local` mode, but right now we're busy testing the different sa3.cpp builds (CUDA, VULKAN, and — very shortly — Metal) to see what breaks.
 >

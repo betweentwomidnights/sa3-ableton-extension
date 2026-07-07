@@ -61,12 +61,13 @@ const BACKEND_DIRS = {
   cuda: "build-cuda",
   vulkan: "build-vulkan",
   cpu: "build",
+  metal: "build-metal",
 };
 
 function selectedBackend() {
   const backend = String(process.env.GARY_SA3_BACKEND || "").trim().toLowerCase();
   if (backend && !BACKEND_DIRS[backend]) {
-    throw new Error(`Unknown GARY_SA3_BACKEND '${backend}' (expected cuda, vulkan, or cpu)`);
+    throw new Error(`Unknown GARY_SA3_BACKEND '${backend}' (expected cuda, vulkan, cpu, or metal)`);
   }
   return backend;
 }
@@ -98,6 +99,111 @@ function run(command, args) {
     stdio: "inherit",
     shell: process.platform === "win32",
   });
+}
+
+function capture(command, args) {
+  return cp.execFileSync(command, args, { encoding: "utf8" });
+}
+
+// Recursively locate a file by basename under dir (dylibs live in ggml subdirs).
+function findByBasename(dir, basename) {
+  const stack = [dir];
+  while (stack.length) {
+    const current = stack.pop();
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (entry.name === basename) {
+        return full;
+      }
+    }
+  }
+  return null;
+}
+
+// The @rpath-relative dylib dependencies of a Mach-O file, by basename.
+function rpathDeps(dylibPath) {
+  const deps = [];
+  for (const line of capture("otool", ["-L", dylibPath]).split("\n")) {
+    const match = line.trim().match(/^@rpath\/(\S+)/);
+    if (match) deps.push(match[1]);
+  }
+  return deps;
+}
+
+// Every LC_RPATH entry currently baked into a Mach-O file.
+function currentRpaths(dylibPath) {
+  const rpaths = [];
+  const lines = capture("otool", ["-l", dylibPath]).split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === "cmd LC_RPATH") {
+      for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+        const match = lines[j].trim().match(/^path\s+(.+?)\s+\(offset/);
+        if (match) {
+          rpaths.push(match[1]);
+          break;
+        }
+      }
+    }
+  }
+  return rpaths;
+}
+
+// macOS: bundle libsa3.dylib plus its ggml deps (metal/blas/cpu/base) flat next
+// to the addon, so the runtime .dylibs resolve via an @loader_path rpath the way
+// the Windows build resolves its co-located .dll set.
+function bundleMacRuntime(outDir) {
+  const sa3CppDir = process.env.SA3_CPP_DIR || path.resolve(root, "..", "sa3.cpp");
+  const backend = selectedBackend() || "metal";
+  const buildDir = path.join(sa3CppDir, BACKEND_DIRS[backend]);
+  const rootLib = path.join(buildDir, "libsa3.dylib");
+  if (!exists(rootLib)) {
+    throw new Error(
+      `GARY_SA3_BACKEND=${backend} but libsa3.dylib not found in ${buildDir} ` +
+      `(build it first: 'build.sh ${backend}' in ${sa3CppDir})`);
+  }
+
+  console.log(`[native] bundling SA3 dylibs from ${buildDir}`);
+  const copied = new Set();
+  const queue = ["libsa3.dylib"];
+  while (queue.length) {
+    const name = queue.shift();
+    if (copied.has(name)) continue;
+    const src = name === "libsa3.dylib" ? rootLib : findByBasename(buildDir, name);
+    if (!src) {
+      throw new Error(`could not locate ${name} (dependency of libsa3.dylib) under ${buildDir}`);
+    }
+    const dest = path.join(outDir, name);
+    fs.copyFileSync(src, dest); // follows symlinks -> copies the real dylib
+    fs.chmodSync(dest, 0o755);
+    copied.add(name);
+    for (const dep of rpathDeps(dest)) {
+      if (!copied.has(dep)) queue.push(dep);
+    }
+  }
+
+  // Make each dylib self-contained: strip the absolute build-tree rpaths baked in
+  // by the sa3.cpp build (they leak local paths and get searched before the
+  // bundled copies), leaving only @loader_path so siblings resolve from this dir.
+  // Then re-adhoc-sign: install_name_tool invalidates the signature, and arm64
+  // refuses to dlopen an unsigned/invalidly-signed dylib.
+  for (const name of copied) {
+    const dest = path.join(outDir, name);
+    let hasLoaderPath = false;
+    for (const rpath of currentRpaths(dest)) {
+      if (rpath === "@loader_path") {
+        hasLoaderPath = true;
+      } else {
+        run("install_name_tool", ["-delete_rpath", rpath, dest]);
+      }
+    }
+    if (!hasLoaderPath) {
+      run("install_name_tool", ["-add_rpath", "@loader_path", dest]);
+    }
+    run("codesign", ["--force", "--sign", "-", dest]);
+  }
+  console.log(`[native] bundled ${copied.size} dylibs: ${[...copied].join(", ")}`);
 }
 
 if (process.env.GARY_SA3_SKIP_NATIVE === "1") {
@@ -141,6 +247,8 @@ if (platform === "win32") {
     copyGlob(cudaDir, "cublas64_*.dll", outDir);
     copyGlob(cudaDir, "cublasLt64_*.dll", outDir);
   }
+} else if (platform === "darwin") {
+  bundleMacRuntime(outDir);
 }
 
 console.log(`[native] embedded SA3 assets ready: ${outDir}`);

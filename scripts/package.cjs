@@ -10,7 +10,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const KNOWN_BACKENDS = ["cuda", "vulkan", "cpu"];
+const KNOWN_BACKENDS = ["cuda", "vulkan", "cpu", "metal"];
 
 let backends = process.argv.slice(2).map((value) => value.trim().toLowerCase()).filter(Boolean);
 if (backends.length === 0) {

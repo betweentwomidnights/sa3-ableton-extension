@@ -84,13 +84,14 @@ this branch embeds `sa3.cpp` directly inside the extension as a native node addo
 
 the addon itself is backend-agnostic — it `LoadLibrary`s `sa3.dll` at runtime, so the only difference between builds is which `ggml` runtime DLLs are bundled next to it. three flavours:
 
-| backend | build script | bundled DLLs | .ablx size | notes |
+| backend | build script | bundled runtime | .ablx size | notes |
 | --- | --- | --- | --- | --- |
 | cuda   | `npm run package:cuda`   | `ggml-cuda` + CUDA runtime (`cublas*`, `cudart*`) | ~600 MB | fastest on NVIDIA; huge because of the CUDA runtime |
 | vulkan | `npm run package:vulkan` | `ggml-vulkan` | ~15 MB | runs on any Vulkan GPU (NVIDIA/AMD/Intel); needs the system Vulkan loader (`vulkan-1.dll`, ships with GPU drivers). basically as fast as CUDA for this workload |
 | cpu    | `npm run package:cpu`    | static `ggml-cpu` | ~3 MB | no GPU needed. slow for `medium`, genuinely usable for `small-music` |
+| metal  | `npm run package:metal`  | `libsa3.dylib` + `ggml` dylibs (`ggml-metal`, `ggml-blas`, `ggml-cpu`, `ggml-base`) | ~15 MB | **macOS / Apple Silicon only**. uses the Metal GPU backend; the Metal shaders are embedded in `libggml-metal.dylib` (no separate `.metallib`). the packager rewrites the dylib rpaths to `@loader_path` and re-adhoc-signs them so the extension host can `dlopen` them |
 
-`npm run package:all` builds all three in one pass (compiling the addon once). outputs land in `dist/gary-extension-<backend>.ablx` (also copied into the gitignored `releases/`). the backend is selected at build time with `GARY_SA3_BACKEND=cuda|vulkan|cpu`, mapping to the `sa3.cpp/build-cuda`, `build-vulkan`, and `build` runtime dirs respectively.
+`npm run package:all` builds all three Windows flavours in one pass (compiling the addon once). outputs land in `dist/gary-extension-<backend>.ablx` (also copied into the gitignored `releases/`). the backend is selected at build time with `GARY_SA3_BACKEND=cuda|vulkan|cpu|metal`, mapping to the `sa3.cpp/build-cuda`, `build-vulkan`, `build`, and `build-metal` runtime dirs respectively. `metal` is macOS-only (`npm run package:metal`); the Windows `package:all` does not include it.
 
 > the CPU build uses the plain static `build/` (where `ggml-cpu.dll` is a direct
 > dependency and loads from the addon dir). the `build-cpu-variants` tree
@@ -112,9 +113,10 @@ note: all three share the extension id `gary.gary-extension`, so only one can be
 
 ### building from source
 
-the addon compiles against `sa3.cpp` headers and bundles that project's `sa3.dll`
-+ `ggml` runtime DLLs, so **`sa3.cpp` must be checked out next to this repo** (a
-sibling directory), or point `SA3_CPP_DIR` at it:
+the addon compiles against `sa3.cpp` headers and bundles that project's runtime
+(`sa3.dll` + `ggml` DLLs on Windows; `libsa3.dylib` + `ggml` dylibs on macOS), so
+**`sa3.cpp` must be checked out next to this repo** (a sibling directory), or
+point `SA3_CPP_DIR` at it:
 
 ```text
 <parent>/
@@ -125,29 +127,38 @@ sibling directory), or point `SA3_CPP_DIR` at it:
 prerequisites:
 
 - Node 20+, and the Ableton Extensions SDK/CLI tarballs in [vendor/](vendor/) (then `npm install`)
-- Visual Studio 2022 with the C++ toolchain (node-gyp compiles the native addon)
+- **Windows**: Visual Studio 2022 with the C++ toolchain (node-gyp compiles the native addon)
+- **macOS**: the Xcode command-line tools (`xcode-select --install`) for clang + `install_name_tool`/`codesign`
 - **cuda** build: the CUDA Toolkit with `CUDA_PATH` set — the packager copies `cudart*`/`cublas*` from `%CUDA_PATH%\bin`
 - **vulkan** build: the Vulkan SDK (needed to build `sa3.cpp`; running only needs the driver's `vulkan-1.dll`)
+- **metal** build: macOS on Apple Silicon; nothing extra beyond the Xcode CLT (Metal ships with the OS)
 
 **1. build the sa3.cpp runtime** for the backend(s) you want, from the `sa3.cpp` dir:
 
 ```bat
-build.cmd cuda      :: -> build-cuda/
-build.cmd vulkan    :: -> build-vulkan/
-build.cmd cpu       :: -> build/   (the static CPU build the extension packages)
+build.cmd cuda      :: -> build-cuda/    (Windows)
+build.cmd vulkan    :: -> build-vulkan/  (Windows)
+build.cmd cpu       :: -> build/         (the static CPU build the extension packages)
+```
+
+```bash
+./build.sh metal    #  -> build-metal/   (macOS)
 ```
 
 **2. package the extension**, from this repo:
 
 ```bash
 npm install
-npm run package:cuda     # or package:vulkan / package:cpu / package:all
+npm run package:cuda     # Windows: or package:vulkan / package:cpu / package:all
+npm run package:metal    # macOS
 ```
 
 each `.ablx` lands in `dist/` (and the gitignored `releases/`). `GARY_SA3_BACKEND`
 selects which `sa3.cpp` build dir is bundled (`cuda`->`build-cuda`,
-`vulkan`->`build-vulkan`, `cpu`->`build`); override the location with
-`SA3_CPP_DIR` if your checkout isn't the sibling default.
+`vulkan`->`build-vulkan`, `cpu`->`build`, `metal`->`build-metal`); override the
+location with `SA3_CPP_DIR` if your checkout isn't the sibling default. on macOS
+the packager copies `libsa3.dylib` and its `ggml` dylib dependencies flat next to
+the addon, rewrites their rpaths to `@loader_path`, and re-adhoc-signs them.
 
 to iterate in Ableton's dev host without repackaging each time, `npm run start:win`
 runs the extension unsandboxed against a local Live install — set

@@ -12,6 +12,7 @@
     "package:cuda": "node scripts/package.cjs cuda",
     "package:vulkan": "node scripts/package.cjs vulkan",
     "package:cpu": "node scripts/package.cjs cpu",
+    "package:metal": "node scripts/package.cjs metal",
     "package:all": "node scripts/package.cjs cuda vulkan cpu",
     "start": "npm run start:cli",
     "start:cli": "npm run build && extensions-cli run",

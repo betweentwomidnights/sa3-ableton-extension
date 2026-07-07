@@ -5,6 +5,8 @@
 
 #ifdef _WIN32
 #  include <windows.h>
+#else
+#  include <dlfcn.h>
 #endif
 
 #include <algorithm>
@@ -344,16 +346,33 @@ std::string last_windows_error(const std::wstring& path) {
   }
   return out.str();
 }
+#else
+// POSIX (macOS): resolve the directory that holds this native addon so we can
+// dlopen the co-bundled libsa3 dylib next to it. libsa3's ggml deps are wired
+// with an @loader_path rpath by the packager, so they resolve from the same dir.
+std::string module_directory_posix() {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void*>(&module_directory_posix), &info) == 0 ||
+      info.dli_fname == nullptr) {
+    throw std::runtime_error("dladdr failed to locate the native addon path");
+  }
+  std::string path(info.dli_fname);
+  size_t slash = path.find_last_of('/');
+  if (slash == std::string::npos) {
+    throw std::runtime_error("native module path has no directory");
+  }
+  return path.substr(0, slash);
+}
 #endif
 
 void* get_symbol(Sa3Api& api, const char* name) {
 #ifdef _WIN32
   void* symbol = reinterpret_cast<void*>(GetProcAddress(api.module, name));
 #else
-  void* symbol = nullptr;
+  void* symbol = api.module ? dlsym(api.module, name) : nullptr;
 #endif
   if (!symbol) {
-    throw std::runtime_error(std::string("sa3.dll is missing symbol ") + name);
+    throw std::runtime_error(std::string("libsa3 is missing symbol ") + name);
   }
   return symbol;
 }
@@ -377,8 +396,16 @@ bool load_sa3_api(std::string& error) {
     g_api.module = module;
     g_api.native_dir = utf8_from_wide(dir);
 #else
-    error = "embedded SA3 is only wired for Windows in this prototype";
-    return false;
+    std::string dir = module_directory_posix();
+    std::string dylib_path = dir + "/libsa3.dylib";
+    void* module = dlopen(dylib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!module) {
+      const char* reason = dlerror();
+      error = "failed to load " + dylib_path + (reason ? std::string(": ") + reason : "");
+      return false;
+    }
+    g_api.module = module;
+    g_api.native_dir = dir;
 #endif
 
     g_api.init_ex = reinterpret_cast<Sa3InitExFn>(get_symbol(g_api, "sa3_init_ex"));

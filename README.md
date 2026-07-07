@@ -2,6 +2,10 @@
 
 stable audio 3 generation, transformation, and continuation directly inside Ableton Live arrangement selections.
 
+> **update:** this repo now contains a [very experimental branch](https://github.com/betweentwomidnights/sa3-ableton-extension/tree/backends/embedded-sa3) where we are embedding stable audio 3 directly into the extension with the `libsa3` from [sa3.cpp](https://github.com/betweentwomidnights/sa3.cpp) — no separate backend process. it's still in heavy testing (CUDA / VULKAN / and very shortly Metal builds).
+>
+> if you just want to use the local http requests with pytorch, just grab the `.ablx` in the `main` branch here.
+
 **UPDATE:** oops, i misunderstood how easy it was to use just the `.ablx` file if you disable developer mode. if you only want to use the extension, install [gary-extension.ablx](releases/gary-extension.ablx) inside Ableton Live beta with Developer Mode off.
 
 fair warning...you still need an SA3 backend while generating, either Gary4local or the backend in this repo. but you do not need to run the Ableton extension host from a terminal unless you're building on top of this.

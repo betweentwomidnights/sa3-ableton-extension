@@ -110,6 +110,49 @@ note: all three share the extension id `gary.gary-extension`, so only one can be
 > work on NVIDIA, the cuda build is the most consistent. this is all still
 > experimental.
 
+### building from source
+
+the addon compiles against `sa3.cpp` headers and bundles that project's `sa3.dll`
++ `ggml` runtime DLLs, so **`sa3.cpp` must be checked out next to this repo** (a
+sibling directory), or point `SA3_CPP_DIR` at it:
+
+```text
+<parent>/
+  sa3.cpp/                  <- https://github.com/betweentwomidnights/sa3.cpp
+  sa3-ableton-extension/    <- this repo
+```
+
+prerequisites:
+
+- Node 20+, and the Ableton Extensions SDK/CLI tarballs in [vendor/](vendor/) (then `npm install`)
+- Visual Studio 2022 with the C++ toolchain (node-gyp compiles the native addon)
+- **cuda** build: the CUDA Toolkit with `CUDA_PATH` set — the packager copies `cudart*`/`cublas*` from `%CUDA_PATH%\bin`
+- **vulkan** build: the Vulkan SDK (needed to build `sa3.cpp`; running only needs the driver's `vulkan-1.dll`)
+
+**1. build the sa3.cpp runtime** for the backend(s) you want, from the `sa3.cpp` dir:
+
+```bat
+build.cmd cuda      :: -> build-cuda/
+build.cmd vulkan    :: -> build-vulkan/
+build.cmd cpu       :: -> build/   (the static CPU build the extension packages)
+```
+
+**2. package the extension**, from this repo:
+
+```bash
+npm install
+npm run package:cuda     # or package:vulkan / package:cpu / package:all
+```
+
+each `.ablx` lands in `dist/` (and the gitignored `releases/`). `GARY_SA3_BACKEND`
+selects which `sa3.cpp` build dir is bundled (`cuda`->`build-cuda`,
+`vulkan`->`build-vulkan`, `cpu`->`build`); override the location with
+`SA3_CPP_DIR` if your checkout isn't the sibling default.
+
+to iterate in Ableton's dev host without repackaging each time, `npm run start:win`
+runs the extension unsandboxed against a local Live install — set
+`EXTENSION_HOST_PATH` in `.env` to your Live beta path first.
+
 ### device toggle (auto / cpu)
 
 the dialog's embedded panel has a **device** dropdown:

@@ -399,7 +399,7 @@ bool load_sa3_api(std::string& error) {
     const auto get_api = reinterpret_cast<Sa3GetApiFn>(get_symbol(g_api, "sa3_get_api"));
     g_api.api = get_api(SA3_ABI_VERSION_1);
     if (!g_api.api || g_api.api->abi_version != SA3_ABI_VERSION_1 ||
-        g_api.api->size < sizeof(sa3_api_v1)) {
+        g_api.api->size < SA3_API_V1_MIN_SIZE) {
       throw std::runtime_error("libsa3 does not provide the complete C ABI V1 table");
     }
     return true;

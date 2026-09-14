@@ -22,18 +22,16 @@ export interface EmbeddedSa3Request {
   prompt: string;
   negativePrompt: string;
   durationSeconds: number;
-  targetSamples: number;
   steps: number;
   cfgScale: number;
   distShift: string;
   seed: number;
   keepModels: boolean;
-  durationPaddingSec: number;
+  generationTailPaddingSeconds: number;
+  continuationTailPaddingSeconds: number;
   loras: EmbeddedLora[];
   initPath?: string | undefined;
   initNoiseLevel?: number | undefined;
-  inpaintStart?: number | undefined;
-  inpaintEnd?: number | undefined;
   encodeChunkSize: number;
   encodeOverlap: number;
   decodeChunkSize: number;
@@ -524,19 +522,18 @@ export async function runEmbeddedSa3(
       cpuThreads: numberFromEnv("SA3_THREADS", 0),
       prompt: request.prompt,
       negativePrompt: request.negativePrompt,
+      operation: request.operation,
       duration: request.durationSeconds,
-      targetSamples: request.targetSamples,
       steps: request.steps,
       cfgScale: request.cfgScale,
       distShift: request.distShift,
       seed: request.seed,
       keepModels: request.keepModels,
-      durationPaddingSec: request.durationPaddingSec,
+      generationTailPaddingSeconds: request.generationTailPaddingSeconds,
+      continuationTailPaddingSeconds: request.continuationTailPaddingSeconds,
       loras,
       initPath: request.initPath,
       initNoiseLevel: request.initNoiseLevel,
-      inpaintStart: request.inpaintStart,
-      inpaintEnd: request.inpaintEnd,
       encodeChunkSize: request.encodeChunkSize,
       encodeOverlap: request.encodeOverlap,
       decodeChunkSize: request.decodeChunkSize,

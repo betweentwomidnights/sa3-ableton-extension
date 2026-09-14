@@ -18,7 +18,7 @@ this branch embeds `sa3.cpp` directly inside the extension as a native node addo
 
 ### builds (cuda / vulkan / cpu)
 
-the addon itself is backend-agnostic — it `LoadLibrary`s `sa3.dll` at runtime, so the only difference between builds is which `ggml` runtime DLLs are bundled next to it. three flavours:
+the addon itself is backend-agnostic — it `LoadLibrary`s `sa3.dll` at runtime and resolves the versioned C ABI V1 table through `sa3_get_api`, so the only difference between builds is which `ggml` runtime DLLs are bundled next to it. three flavours:
 
 | backend | build script | bundled runtime | .ablx size | notes |
 | --- | --- | --- | --- | --- |
@@ -109,7 +109,7 @@ the dialog's embedded panel has a **device** dropdown:
 
 switching device recreates the libsa3 context on the next generation. handy for A/B-ing GPU vs CPU, and CPU is genuinely usable for `small-music`.
 
-under the hood this sets `sa3_config_ex.device` in libsa3 (added on `main`); the CLI's `SA3_DEVICE=cpu` / `SA3_GPU=<index-or-name>` env vars still work as the fallback when no explicit device is passed.
+under the hood this sets `sa3_context_config_v1.device`; the CLI's `SA3_DEVICE=cpu` / `SA3_GPU=<index-or-name>` env vars still work as the fallback when no explicit device is passed.
 
 ### the sandbox (why there is no file picker)
 

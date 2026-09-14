@@ -1,6 +1,6 @@
 #include <node_api.h>
 
-#include "libsa3.h"
+#include "libsa3_v1.h"
 #include "wav.h"
 
 #ifdef _WIN32
@@ -37,19 +37,18 @@ struct GenerateOptions {
 
   std::string prompt;
   std::string negative_prompt;
+  std::string operation = "generate";
   double duration = 30.0;
-  int target_samples = 0;
   int steps = 8;
   int64_t seed = -1;
   float cfg_scale = 1.0f;
-  float duration_padding_sec = 6.0f;
+  float generation_tail_padding_sec = 6.0f;
+  float continuation_tail_padding_sec = 6.0f;
   bool keep_models = false;
   std::string dist_shift = "LogSNR";
 
   std::string init_path;
   float init_noise_level = 0.85f;
-  float inpaint_start = -1.0f;
-  float inpaint_end = -1.0f;
   int encode_chunk_size = 128;
   int encode_overlap = 32;
   int decode_chunk_size = 128;
@@ -94,13 +93,7 @@ struct ConvertLoraWork {
   std::string error;
 };
 
-using Sa3InitExFn = sa3_context* (*)(const sa3_config_ex*, char*, int);
-using Sa3GenerateExFn = int (*)(sa3_context*, const sa3_request_ex*, sa3_audio*, char*, int);
-using Sa3ConvertLoraFn = int (*)(const char*, const char*, const char*, char*, int);
-using Sa3FreeAudioFn = void (*)(sa3_audio*);
-using Sa3UnloadFn = void (*)(sa3_context*);
-using Sa3FreeFn = void (*)(sa3_context*);
-using Sa3VersionFn = const char* (*)();
+using Sa3GetApiFn = const sa3_api_v1* (SA3_CALL *)(uint32_t);
 
 struct Sa3Api {
 #ifdef _WIN32
@@ -108,13 +101,7 @@ struct Sa3Api {
 #else
   void* module = nullptr;
 #endif
-  Sa3InitExFn init_ex = nullptr;
-  Sa3GenerateExFn generate_ex = nullptr;
-  Sa3ConvertLoraFn convert_lora = nullptr;
-  Sa3FreeAudioFn free_audio = nullptr;
-  Sa3UnloadFn unload = nullptr;
-  Sa3FreeFn free = nullptr;
-  Sa3VersionFn version = nullptr;
+  const sa3_api_v1* api = nullptr;
   std::string native_dir;
 };
 
@@ -245,18 +232,19 @@ GenerateOptions parse_generate_options(napi_env env, napi_value value) {
   options.cpu_threads = get_int(env, value, "cpuThreads", options.cpu_threads);
   options.prompt = get_string(env, value, "prompt", "");
   options.negative_prompt = get_string(env, value, "negativePrompt", "");
+  options.operation = get_string(env, value, "operation", options.operation);
   options.duration = get_double(env, value, "duration", options.duration);
-  options.target_samples = get_int(env, value, "targetSamples", options.target_samples);
   options.steps = get_int(env, value, "steps", options.steps);
   options.seed = get_int64(env, value, "seed", options.seed);
   options.cfg_scale = (float)get_double(env, value, "cfgScale", options.cfg_scale);
-  options.duration_padding_sec = (float)get_double(env, value, "durationPaddingSec", options.duration_padding_sec);
+  options.generation_tail_padding_sec = (float)get_double(
+    env, value, "generationTailPaddingSeconds", options.generation_tail_padding_sec);
+  options.continuation_tail_padding_sec = (float)get_double(
+    env, value, "continuationTailPaddingSeconds", options.continuation_tail_padding_sec);
   options.keep_models = get_bool(env, value, "keepModels", options.keep_models);
   options.dist_shift = get_string(env, value, "distShift", options.dist_shift);
   options.init_path = get_string(env, value, "initPath", "");
   options.init_noise_level = (float)get_double(env, value, "initNoiseLevel", options.init_noise_level);
-  options.inpaint_start = (float)get_double(env, value, "inpaintStart", options.inpaint_start);
-  options.inpaint_end = (float)get_double(env, value, "inpaintEnd", options.inpaint_end);
   options.encode_chunk_size = get_int(env, value, "encodeChunkSize", options.encode_chunk_size);
   options.encode_overlap = get_int(env, value, "encodeOverlap", options.encode_overlap);
   options.decode_chunk_size = get_int(env, value, "decodeChunkSize", options.decode_chunk_size);
@@ -265,6 +253,9 @@ GenerateOptions parse_generate_options(napi_env env, napi_value value) {
 
   if (!std::isfinite(options.duration) || options.duration <= 0.0) {
     throw std::runtime_error("duration must be positive");
+  }
+  if (options.operation != "generate" && options.operation != "transform" && options.operation != "continue") {
+    throw std::runtime_error("operation must be generate, transform, or continue");
   }
   if (options.cpu_threads < 0) {
     throw std::runtime_error("cpuThreads must be >= 0");
@@ -285,9 +276,6 @@ ConvertLoraOptions parse_convert_lora_options(napi_env env, napi_value value) {
   options.output_path = get_string(env, value, "outputPath", "");
   if (options.safetensors_path.empty()) {
     throw std::runtime_error("safetensorsPath is required");
-  }
-  if (options.json_path.empty()) {
-    throw std::runtime_error("jsonPath is required");
   }
   if (options.output_path.empty()) {
     throw std::runtime_error("outputPath is required");
@@ -379,7 +367,7 @@ void* get_symbol(Sa3Api& api, const char* name) {
 
 bool load_sa3_api(std::string& error) {
   std::lock_guard<std::mutex> lock(g_api_mutex);
-  if (g_api.module) return true;
+  if (g_api.module && g_api.api) return true;
 
   try {
 #ifdef _WIN32
@@ -408,24 +396,36 @@ bool load_sa3_api(std::string& error) {
     g_api.native_dir = dir;
 #endif
 
-    g_api.init_ex = reinterpret_cast<Sa3InitExFn>(get_symbol(g_api, "sa3_init_ex"));
-    g_api.generate_ex = reinterpret_cast<Sa3GenerateExFn>(get_symbol(g_api, "sa3_generate_ex"));
-    g_api.convert_lora = reinterpret_cast<Sa3ConvertLoraFn>(get_symbol(g_api, "sa3_convert_lora"));
-    g_api.free_audio = reinterpret_cast<Sa3FreeAudioFn>(get_symbol(g_api, "sa3_free_audio"));
-    g_api.unload = reinterpret_cast<Sa3UnloadFn>(get_symbol(g_api, "sa3_unload"));
-    g_api.free = reinterpret_cast<Sa3FreeFn>(get_symbol(g_api, "sa3_free"));
-    g_api.version = reinterpret_cast<Sa3VersionFn>(get_symbol(g_api, "sa3_version"));
+    const auto get_api = reinterpret_cast<Sa3GetApiFn>(get_symbol(g_api, "sa3_get_api"));
+    g_api.api = get_api(SA3_ABI_VERSION_1);
+    if (!g_api.api || g_api.api->abi_version != SA3_ABI_VERSION_1 ||
+        g_api.api->size < sizeof(sa3_api_v1)) {
+      throw std::runtime_error("libsa3 does not provide the complete C ABI V1 table");
+    }
     return true;
   } catch (const std::exception& e) {
     error = e.what();
+#ifdef _WIN32
+    if (g_api.module) FreeLibrary(g_api.module);
+#else
+    if (g_api.module) dlclose(g_api.module);
+#endif
+    g_api = {};
     return false;
   }
 }
 
-// "cpu" forces the CPU backend via sa3_config_ex.device; anything else lets
+// "cpu" forces the CPU backend through the V1 context config; anything else lets
 // libsa3 pick a GPU (then fall back to CPU).
 std::string normalized_device(const std::string& device) {
   return device == "cpu" ? "cpu" : "auto";
+}
+
+sa3_distribution_shift_v1 distribution_shift(const std::string& name) {
+  if (name == "Flux") return SA3_DISTRIBUTION_FLUX_V1;
+  if (name == "Full") return SA3_DISTRIBUTION_FULL_V1;
+  if (name == "None") return SA3_DISTRIBUTION_NONE_V1;
+  return SA3_DISTRIBUTION_LOGSNR_V1;
 }
 
 std::string context_key(const GenerateOptions& options) {
@@ -439,29 +439,30 @@ std::string context_key(const GenerateOptions& options) {
   return out.str();
 }
 
-sa3_context* ensure_context(const GenerateOptions& options, Sa3Api& api, char* err, int err_len) {
+sa3_context* ensure_context(const GenerateOptions& options, Sa3Api& api, sa3_error_v1& error) {
   const std::string key = context_key(options);
   if (g_context && key == g_context_key) {
     return g_context;
   }
 
   if (g_context) {
-    api.free(g_context);
+    api.api->context_destroy(g_context);
     g_context = nullptr;
     g_context_key.clear();
   }
 
-  sa3_config_ex config = {};
-  config.config.models_dir = options.models_dir.empty() ? nullptr : options.models_dir.c_str();
-  config.config.adapters_dir = options.adapters_dir.empty() ? nullptr : options.adapters_dir.c_str();
-  config.config.variant = options.variant.empty() ? nullptr : options.variant.c_str();
-  config.config.encoding = options.encoding.empty() ? nullptr : options.encoding.c_str();
+  sa3_context_config_v1 config = {};
+  config.size = sizeof(config);
+  api.api->context_config_init(&config);
+  config.models_dir = options.models_dir.empty() ? nullptr : options.models_dir.c_str();
+  config.adapters_dir = options.adapters_dir.empty() ? nullptr : options.adapters_dir.c_str();
+  config.variant = options.variant.empty() ? nullptr : options.variant.c_str();
+  config.dit_encoding = options.encoding.empty() ? nullptr : options.encoding.c_str();
   config.cpu_threads = options.cpu_threads;
   const std::string device = normalized_device(options.device);
   config.device = device == "cpu" ? "cpu" : nullptr;
 
-  g_context = api.init_ex(&config, err, err_len);
-  if (!g_context) {
+  if (api.api->context_create(&config, &g_context, &error) != SA3_STATUS_OK_V1) {
     return nullptr;
   }
   g_context_key = key;
@@ -485,10 +486,11 @@ void progress_call_js(napi_env env, napi_value js_cb, void* /*context*/, void* d
 }
 
 // Runs on the libsa3 worker thread: queue the tick for the JS thread.
-void progress_trampoline(void* user, const char* stage, int step, int total, float fraction) {
+void SA3_CALL progress_trampoline(void* user, const sa3_progress_v1* progress) {
   auto tsfn = static_cast<napi_threadsafe_function>(user);
-  if (!tsfn) return;
-  auto* msg = new ProgressMsg{stage ? stage : "", step, total, (double)fraction};
+  if (!tsfn || !progress) return;
+  auto* msg = new ProgressMsg{progress->stage_name ? progress->stage_name : "",
+                              progress->step, progress->total, (double)progress->fraction};
   if (napi_call_threadsafe_function(tsfn, msg, napi_tsfn_nonblocking) != napi_ok) {
     delete msg;
   }
@@ -517,97 +519,91 @@ void execute_generate(napi_env, void* data) {
       init_audio = sa3::read_wav_planar(work->options.init_path, init_samples, init_channels, init_sample_rate);
     }
 
-    std::vector<const char*> lora_names;
-    std::vector<float> lora_strengths;
-    lora_names.reserve(work->options.loras.size());
-    lora_strengths.reserve(work->options.loras.size());
+    std::vector<sa3_adapter_v1> adapters;
+    adapters.reserve(work->options.loras.size());
     for (const auto& lora : work->options.loras) {
-      lora_names.push_back(lora.name.c_str());
-      lora_strengths.push_back(lora.strength);
+      sa3_adapter_v1 adapter = {};
+      adapter.size = sizeof(adapter);
+      api.api->adapter_init(&adapter);
+      adapter.path_or_name = lora.name.c_str();
+      adapter.strength = lora.strength;
+      adapters.push_back(adapter);
     }
 
-    sa3_request_ex request = {};
-    request.request.prompt = work->options.prompt.c_str();
-    request.request.negative_prompt = work->options.negative_prompt.empty()
+    sa3_request_v1 request = {};
+    request.size = sizeof(request);
+    api.api->request_init(&request);
+    request.operation = work->options.operation == "transform" ? SA3_OPERATION_TRANSFORM_V1
+                      : work->options.operation == "continue" ? SA3_OPERATION_CONTINUE_V1
+                                                               : SA3_OPERATION_GENERATE_V1;
+    request.prompt = work->options.prompt.c_str();
+    request.negative_prompt = work->options.negative_prompt.empty()
       ? nullptr
       : work->options.negative_prompt.c_str();
-    request.request.frames = std::max(1, (int)(work->options.duration * 44100.0 / 4096.0 + 0.5));
-    if (work->options.variant.rfind("small", 0) == 0 && (request.request.frames & 1)) {
-      request.request.frames++;
-    }
-    request.request.steps = work->options.steps > 0 ? work->options.steps : 8;
-    request.request.seed = work->options.seed;
-    request.request.cfg_scale = work->options.cfg_scale;
-    request.request.duration_padding_sec = work->options.duration_padding_sec;
-    request.request.keep_models = work->options.keep_models ? 1 : 0;
-    request.request.n_loras = (int)lora_names.size();
-    request.request.lora_names = lora_names.empty() ? nullptr : lora_names.data();
-    request.request.lora_strengths = lora_strengths.empty() ? nullptr : lora_strengths.data();
-    request.request.dist_shift = work->options.dist_shift.empty() ? nullptr : work->options.dist_shift.c_str();
+    request.duration_seconds = work->options.duration;
+    request.steps = work->options.steps > 0 ? work->options.steps : 8;
+    request.seed = work->options.seed;
+    request.cfg_scale = work->options.cfg_scale;
+    request.generation_tail_padding_seconds = work->options.generation_tail_padding_sec;
+    request.continuation_tail_padding_seconds = work->options.continuation_tail_padding_sec;
+    request.residency = work->options.keep_models ? SA3_RESIDENCY_RESIDENT_V1 : SA3_RESIDENCY_FRUGAL_V1;
+    request.distribution_shift = distribution_shift(work->options.dist_shift);
+    request.adapters = adapters.empty() ? nullptr : adapters.data();
+    request.adapter_count = (uint32_t)adapters.size();
     request.encode_chunk_size = work->options.encode_chunk_size;
     request.encode_overlap = work->options.encode_overlap;
     request.decode_chunk_size = work->options.decode_chunk_size;
     request.decode_overlap = work->options.decode_overlap;
 
     if (work->tsfn) {
-      request.request.on_progress = progress_trampoline;
-      request.request.user = work->tsfn;
+      request.on_progress = progress_trampoline;
+      request.callback_user = work->tsfn;
     }
 
     if (!init_audio.empty()) {
-      request.init_audio.mode = (work->options.inpaint_start >= 0.0f || work->options.inpaint_end >= 0.0f)
-        ? SA3_INIT_AUDIO_INPAINT
-        : SA3_INIT_AUDIO_A2A;
-      request.init_audio.samples = init_audio.data();
-      request.init_audio.n_samp = init_samples;
-      request.init_audio.n_ch = init_channels;
-      request.init_audio.sample_rate = init_sample_rate;
-      request.init_audio.init_noise_level = work->options.init_noise_level;
-      request.init_audio.inpaint_start = work->options.inpaint_start;
-      request.init_audio.inpaint_end = work->options.inpaint_end;
+      request.input_audio.samples = init_audio.data();
+      request.input_audio.n_samples = (uint64_t)init_samples;
+      request.input_audio.n_channels = (uint32_t)init_channels;
+      request.input_audio.sample_rate = (uint32_t)init_sample_rate;
+      request.transform_noise_level = work->options.init_noise_level;
     }
 
-    char err[4096] = {};
-    sa3_audio audio = {};
+    sa3_error_v1 error = {};
+    error.size = sizeof(error);
+    api.api->error_init(&error);
+    sa3_result_v1 audio = {};
+    audio.size = sizeof(audio);
+    api.api->result_init(&audio);
     {
       std::lock_guard<std::mutex> lock(g_context_mutex);
-      sa3_context* context = ensure_context(work->options, api, err, (int)sizeof(err));
+      sa3_context* context = ensure_context(work->options, api, error);
       if (!context) {
-        work->error = err[0] ? err : "sa3_init_ex failed";
+        work->error = error.message[0] ? error.message : "sa3 context creation failed";
         return;
       }
 
-      int rc = api.generate_ex(context, &request, &audio, err, (int)sizeof(err));
-      if (rc != 0) {
-        work->error = err[0] ? err : "sa3_generate_ex failed";
+      const sa3_status_v1 status = api.api->generate(context, &request, &audio, &error);
+      if (status != SA3_STATUS_OK_V1) {
+        work->error = error.message[0] ? error.message : "sa3 V1 generation failed";
         return;
       }
     }
 
-    int output_samples = audio.n_samp;
-    if (work->options.target_samples > 0) {
-      output_samples = std::min(output_samples, work->options.target_samples);
+    if (!audio.samples || audio.n_samples == 0 || audio.n_channels == 0 || audio.sample_rate == 0 ||
+        audio.n_samples > (uint64_t)std::numeric_limits<int>::max() ||
+        audio.n_channels > (uint32_t)std::numeric_limits<int>::max()) {
+      api.api->result_free(&audio);
+      work->error = "libsa3 returned invalid V1 audio";
+      return;
     }
-
-    if (output_samples < audio.n_samp && audio.n_ch > 1) {
-      // wav_planar_bytes uses its length argument as the per-channel stride, so
-      // passing a trimmed length against the full-length planar buffer would read
-      // channels > 0 from the wrong offset (right channel shifted by the trimmed
-      // tail). Compact each channel to the trimmed stride first.
-      std::vector<float> compacted((size_t)output_samples * audio.n_ch);
-      for (int c = 0; c < audio.n_ch; c++) {
-        const float* src = audio.samples + (size_t)c * audio.n_samp;
-        std::copy(src, src + output_samples, compacted.begin() + (size_t)c * output_samples);
-      }
-      work->wav_bytes = sa3::wav_planar_bytes(compacted.data(), output_samples, audio.n_ch, audio.sample_rate);
-    } else {
-      work->wav_bytes = sa3::wav_planar_bytes(audio.samples, output_samples, audio.n_ch, audio.sample_rate);
-    }
+    const int output_samples = (int)audio.n_samples;
+    work->wav_bytes = sa3::wav_planar_bytes(audio.samples, output_samples,
+                                            (int)audio.n_channels, (int)audio.sample_rate);
     work->seed = audio.seed;
-    work->sample_rate = audio.sample_rate;
-    work->channels = audio.n_ch;
+    work->sample_rate = (int)audio.sample_rate;
+    work->channels = (int)audio.n_channels;
     work->samples = output_samples;
-    api.free_audio(&audio);
+    api.api->result_free(&audio);
   } catch (const std::exception& e) {
     work->error = e.what();
   } catch (...) {
@@ -715,15 +711,18 @@ void execute_convert_lora(napi_env, void* data) {
       api = g_api;
     }
 
-    char err[4096] = {};
-    int rc = api.convert_lora(
-      work->options.safetensors_path.c_str(),
-      work->options.json_path.c_str(),
-      work->options.output_path.c_str(),
-      err,
-      (int)sizeof(err));
-    if (rc != 0) {
-      work->error = err[0] ? err : "sa3_convert_lora failed";
+    sa3_lora_convert_v1 options = {};
+    options.size = sizeof(options);
+    api.api->lora_convert_init(&options);
+    options.safetensors_path = work->options.safetensors_path.c_str();
+    options.json_path = work->options.json_path.empty() ? nullptr : work->options.json_path.c_str();
+    options.output_gguf_path = work->options.output_path.c_str();
+    sa3_error_v1 error = {};
+    error.size = sizeof(error);
+    api.api->error_init(&error);
+    const sa3_status_v1 status = api.api->convert_lora(&options, &error);
+    if (status != SA3_STATUS_OK_V1) {
+      work->error = error.message[0] ? error.message : "sa3 V1 LoRA conversion failed";
     }
   } catch (const std::exception& e) {
     work->error = e.what();
@@ -802,7 +801,7 @@ napi_value diagnostics(napi_env env, napi_callback_info) {
       api = g_api;
     }
     napi_value version;
-    const char* version_text = api.version ? api.version() : "";
+    const char* version_text = api.api && api.api->runtime_version ? api.api->runtime_version() : "";
     napi_create_string_utf8(env, version_text, NAPI_AUTO_LENGTH, &version);
     napi_set_named_property(env, result, "version", version);
 

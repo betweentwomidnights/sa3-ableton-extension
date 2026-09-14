@@ -618,7 +618,6 @@ async function submitAndDownloadTransform(
         operation: "transform",
         initPath: sourceWavPath,
         initNoiseLevel: settings.strength,
-        durationPaddingSec: 0.0,
       }),
       outputPath,
       update,
@@ -775,17 +774,13 @@ async function submitAndDownloadContinue(
 
   if (isEmbeddedBackendUrl(baseUrl)) {
     console.log(
-      `[gary-sa3] embedded SA3 continue selected source=${sourceDurationSeconds.toFixed(3)}s add=${continuationSeconds.toFixed(3)}s total=${totalDurationSeconds.toFixed(3)}s gen=${sa3CppGenDurationSeconds.toFixed(3)}s target_samples=${targetSamples}`,
+      `[gary-sa3] embedded SA3 continue selected source=${sourceDurationSeconds.toFixed(3)}s add=${continuationSeconds.toFixed(3)}s total=${totalDurationSeconds.toFixed(3)}s`,
     );
     const outputPath = await outputWavPath(context, "continue", path.dirname(sourceWavPath));
     const continued = await runEmbeddedSa3(
-      embeddedSa3Request(settings, prompt, sa3CppGenDurationSeconds, {
+      embeddedSa3Request(settings, prompt, continuationSeconds, {
         operation: "continue",
-        targetSamples,
         initPath: sourceWavPath,
-        inpaintStart: Number(sourceDurationSeconds.toFixed(3)),
-        inpaintEnd: Number(sa3CppGenDurationSeconds.toFixed(3)),
-        durationPaddingSec: 0.0,
       }),
       outputPath,
       update,
@@ -913,7 +908,6 @@ function embeddedSa3Request(
   durationSeconds: number,
   overrides: Partial<EmbeddedSa3Request> & Pick<EmbeddedSa3Request, "operation">,
 ): EmbeddedSa3Request {
-  const targetSamples = overrides.targetSamples ?? durationToSamples(durationSeconds);
   return {
     operation: overrides.operation,
     ...embeddedOptionsFromSettings(settings),
@@ -921,8 +915,8 @@ function embeddedSa3Request(
     prompt,
     negativePrompt: settings.negativePrompt,
     durationSeconds,
-    targetSamples,
-    durationPaddingSec: overrides.durationPaddingSec ?? SA3_CPP_TAIL_PAD_SECONDS,
+    generationTailPaddingSeconds: SA3_CPP_TAIL_PAD_SECONDS,
+    continuationTailPaddingSeconds: SA3_CPP_TAIL_PAD_SECONDS,
     steps: settings.steps,
     cfgScale: settings.cfgScale,
     distShift: sa3CppDistShift(settings.shift),
@@ -934,8 +928,6 @@ function embeddedSa3Request(
     })),
     initPath: overrides.initPath,
     initNoiseLevel: overrides.initNoiseLevel,
-    inpaintStart: overrides.inpaintStart,
-    inpaintEnd: overrides.inpaintEnd,
     encodeChunkSize: 128,
     encodeOverlap: 32,
     decodeChunkSize: 128,

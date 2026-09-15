@@ -2,7 +2,7 @@
 
 stable audio 3 generation, transformation, and continuation directly inside Ableton Live arrangement selections.
 
-> ## embedded sa3.cpp release candidate
+> ## embedded sa3.cpp v0.2.0
 >
 > this version embeds [sa3.cpp](https://github.com/betweentwomidnights/sa3.cpp) directly through its V1 C ABI. there is no backend URL or separate server process.
 >

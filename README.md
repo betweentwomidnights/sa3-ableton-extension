@@ -10,6 +10,10 @@ stable audio 3 generation, transformation, and continuation directly inside Able
 >
 > install the appropriate `.ablx` with Developer Mode **off** in Ableton Live beta.
 
+The former Python/server-backed extension is preserved on the
+[`legacy/python-server`](https://github.com/betweentwomidnights/sa3-ableton-extension/tree/legacy/python-server)
+branch for existing users and historical reference.
+
 ## embedded sa3.cpp backend
 
 the extension embeds `sa3.cpp` directly as a native node addon — no separate backend process or backend URL to configure.

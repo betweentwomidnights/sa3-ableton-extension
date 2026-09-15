@@ -7,12 +7,14 @@
   <script>
     const initial = __INITIAL_JSON__;
     let availableLoras = initial.availableLoras || [];
-    const localBackendUrl = initial.localBackendUrl;
+    let decoderPreference = initial.decoderLoraEnabled !== false;
     const isWebKitMessageHandlerAvailable = window.webkit &&
       window.webkit.messageHandlers &&
       window.webkit.messageHandlers.live;
     const isWebView2 = window.chrome && window.chrome.webview;
     let saveTimer = 0;
+    let modelPollTimer = 0;
+    let decoderPollTimer = 0;
 
     function sendMessage(message) {
       if (isWebKitMessageHandlerAvailable) {
@@ -40,8 +42,23 @@
 
     function readSettings() {
       const continueBars = Number(value("continueBars"));
+      const endingMode = document.querySelector('input[name="endingMode"]:checked');
+      const selectedEndingMode = endingMode ? endingMode.value : "keeps-going";
       return {
-        backendUrl: value("backendUrl"),
+        embeddedModelsDir: value("embeddedModelsDir"),
+        embeddedLorasDir: value("embeddedLorasDir"),
+        embeddedVariant: value("embeddedVariant"),
+        embeddedEncoding: value("embeddedEncoding"),
+        embeddedDevice: value("embeddedDevice"),
+        keepModelsResident: checked("keepModelsResident"),
+        decoderLoraEnabled: decoderPreference,
+        generationEndingMode: operation() === "generate" ? selectedEndingMode : initial.generationEndingMode,
+        continuationEndingMode: operation() === "continue" ? selectedEndingMode : initial.continuationEndingMode,
+        peakNormalize: checked("peakNormalize"),
+        peakNormalizeDb: Number(value("peakNormalizeDb")),
+        limiter: checked("limiter"),
+        limiterCeilingDb: Number(value("limiterCeilingDb")),
+        limiterKnee: Number(value("limiterKnee")),
         prompt: value("prompt"),
         strength: Number(value("strength")),
         steps: Number(value("steps")),
@@ -115,35 +132,6 @@
       return readLoras().map((lora) => lora.name).filter(Boolean);
     }
 
-    function normalizeUrl(url) {
-      return String(url || "").trim().replace(/\/+$/, "");
-    }
-
-    function backendMode() {
-      const current = normalizeUrl(value("backendUrl"));
-      if (current === normalizeUrl(localBackendUrl)) {
-        return "local";
-      }
-      return "custom";
-    }
-
-    function updateBackendModeUi() {
-      const mode = backendMode();
-      el("backendToggle").textContent = mode === "local" ? "local" : "custom";
-      el("backendToggle").title = mode === "local"
-        ? "using localhost SA3 backend"
-        : "reset to localhost SA3 backend";
-    }
-
-    function resetBackendToLocal() {
-      el("backendUrl").value = localBackendUrl;
-      updateBackendModeUi();
-      persistSettingsSoon();
-      setHealth("checking...", "pending");
-      void checkBackendHealth();
-      void refreshLorasInPlace();
-    }
-
     function setHealth(text, state) {
       const node = el("healthStatus");
       node.textContent = text;
@@ -171,6 +159,291 @@
       }
     }
 
+    async function postJsonWithTimeout(url, body, timeoutMs) {
+      const controller = timeoutMs > 0 ? new AbortController() : null;
+      const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : 0;
+
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          signal: controller ? controller.signal : undefined,
+          headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(body || {})
+        });
+        const text = await response.text();
+        const json = text.trim() ? JSON.parse(text) : {};
+        if (!response.ok) {
+          throw new Error(errorFromResponse(json, `HTTP ${response.status}`));
+        }
+        return json;
+      } finally {
+        if (timeout) {
+          clearTimeout(timeout);
+        }
+      }
+    }
+
+    function embeddedOptions() {
+      return {
+        modelsDir: value("embeddedModelsDir"),
+        adaptersDir: value("embeddedLorasDir"),
+        variant: value("embeddedVariant"),
+        encoding: value("embeddedEncoding")
+      };
+    }
+
+    function setEmbeddedModelStatus(text, state) {
+      const node = el("embeddedModelsStatus");
+      node.textContent = text || "";
+      node.dataset.state = state || "";
+    }
+
+    function renderEmbeddedModelStatus(status) {
+      const download = status && status.download && status.download.active ? status.download : status;
+      const active = Boolean(download && download.active);
+      const button = el("embeddedModelsDownload");
+      button.dataset.active = active ? "true" : "false";
+      button.textContent = active ? "cancel" : "download";
+
+      if (!download) {
+        setEmbeddedModelStatus("not checked", "");
+        return;
+      }
+
+      if (download.error) {
+        setEmbeddedModelStatus(download.error, "offline");
+        return;
+      }
+
+      if (active) {
+        const pct = Math.round(Number(download.progress || 0) * 100);
+        setEmbeddedModelStatus(`${pct}% ${download.label || "downloading"}`, "pending");
+        return;
+      }
+
+      if (download.complete) {
+        setEmbeddedModelStatus(`${download.variant || value("embeddedVariant")} ${download.encoding || value("embeddedEncoding")} ready`, "online");
+        return;
+      }
+
+      const missing = Array.isArray(download.missing) && download.missing.length > 0
+        ? download.missing.join(", ")
+        : "models";
+      setEmbeddedModelStatus(`missing ${missing}`, "offline");
+    }
+
+    async function checkEmbeddedModels() {
+      try {
+        const json = await fetchJsonWithTimeout(appendQuery("/api/embedded/models/status", embeddedOptions()), 8000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, "model check failed"));
+        }
+        renderEmbeddedModelStatus(json);
+        applyEmbeddedDetection(json);
+        if (json.download && json.download.active) {
+          scheduleEmbeddedModelPoll();
+        }
+      } catch (error) {
+        setEmbeddedModelStatus("model check failed", "offline");
+      }
+    }
+
+    function scheduleEmbeddedModelPoll() {
+      clearTimeout(modelPollTimer);
+      modelPollTimer = setTimeout(() => {
+        void pollEmbeddedModels();
+      }, 1000);
+    }
+
+    async function pollEmbeddedModels() {
+      try {
+        const json = await fetchJsonWithTimeout(appendQuery("/api/embedded/models/status", embeddedOptions()), 8000);
+        renderEmbeddedModelStatus(json);
+        applyEmbeddedDetection(json);
+        if (json.download && json.download.active) {
+          scheduleEmbeddedModelPoll();
+        } else {
+          void checkBackendHealth();
+          void refreshLorasInPlace();
+        }
+      } catch {
+        scheduleEmbeddedModelPoll();
+      }
+    }
+
+    async function downloadOrCancelEmbeddedModels() {
+      const button = el("embeddedModelsDownload");
+      button.disabled = true;
+
+      try {
+        const active = button.dataset.active === "true";
+        const json = active
+          ? await postJsonWithTimeout("/api/embedded/models/cancel", embeddedOptions(), 8000)
+          : await postJsonWithTimeout("/api/embedded/models/download", embeddedOptions(), 30000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, active ? "cancel failed" : "download failed"));
+        }
+        renderEmbeddedModelStatus(json);
+        if (json.active || !active) {
+          scheduleEmbeddedModelPoll();
+        }
+      } catch (error) {
+        setEmbeddedModelStatus(error instanceof Error ? error.message : "download failed", "offline");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function setDecoderStatus(text, state) {
+      const node = el("decoderStatus");
+      node.textContent = text || "";
+      node.dataset.state = state || "";
+    }
+
+    function renderDecoderStatus(status) {
+      const active = Boolean(status && status.active);
+      const compatible = value("embeddedVariant") === "medium";
+      const installed = Boolean(status && status.installed);
+      const button = el("decoderDownload");
+      const toggle = el("decoderLoraEnabled");
+      button.dataset.active = active ? "true" : "false";
+      button.textContent = active ? "cancel" : installed ? "downloaded" : "download";
+      button.disabled = (!compatible && !active) || (installed && !active);
+      toggle.disabled = !compatible || !installed;
+      toggle.checked = compatible ? decoderPreference : false;
+
+      if (!compatible) {
+        setDecoderStatus(`medium / SAME-L only; saved ${decoderPreference ? "on" : "off"} for medium`, "");
+      } else if (status && status.error) {
+        setDecoderStatus(status.error, "offline");
+      } else if (active) {
+        const pct = Math.round(Number(status.progress || 0) * 100);
+        setDecoderStatus(`${pct}% ${status.label || "downloading"}`, "pending");
+      } else if (installed) {
+        setDecoderStatus("squeakfix_v3 ready", "online");
+      } else {
+        setDecoderStatus("not installed", "offline");
+      }
+    }
+
+    async function checkDecoderLora() {
+      try {
+        const json = await fetchJsonWithTimeout(appendQuery("/api/embedded/decoder/status", embeddedOptions()), 8000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, "decoder check failed"));
+        }
+        renderDecoderStatus(json);
+        if (json.active) scheduleDecoderPoll();
+      } catch (error) {
+        setDecoderStatus("decoder check failed", "offline");
+      }
+    }
+
+    function scheduleDecoderPoll() {
+      clearTimeout(decoderPollTimer);
+      decoderPollTimer = setTimeout(() => void pollDecoderLora(), 1000);
+    }
+
+    async function pollDecoderLora() {
+      try {
+        const json = await fetchJsonWithTimeout(appendQuery("/api/embedded/decoder/status", embeddedOptions()), 8000);
+        renderDecoderStatus(json);
+        if (json.active) {
+          scheduleDecoderPoll();
+        } else if (json.installed) {
+          decoderPreference = true;
+          el("decoderLoraEnabled").checked = value("embeddedVariant") === "medium";
+          persistSettingsSoon();
+        }
+      } catch {
+        scheduleDecoderPoll();
+      }
+    }
+
+    async function downloadOrCancelDecoderLora() {
+      const button = el("decoderDownload");
+      button.disabled = true;
+      try {
+        const active = button.dataset.active === "true";
+        const endpoint = active ? "/api/embedded/decoder/cancel" : "/api/embedded/decoder/download";
+        const json = await postJsonWithTimeout(endpoint, embeddedOptions(), 30000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, active ? "cancel failed" : "download failed"));
+        }
+        renderDecoderStatus(json);
+        if (json.active || !active) scheduleDecoderPoll();
+      } catch (error) {
+        setDecoderStatus(error instanceof Error ? error.message : "decoder download failed", "offline");
+      } finally {
+        button.disabled = false;
+        void checkDecoderLora();
+      }
+    }
+
+    async function revealEmbeddedFolder(kind) {
+      const button = el(kind === "models" ? "embeddedModelsReveal" : "embeddedLorasReveal");
+      button.disabled = true;
+
+      try {
+        const json = await postJsonWithTimeout(`/api/embedded/${kind}/reveal`, embeddedOptions(), 15000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, "could not open folder"));
+        }
+        setStatus(`opened ${kind} folder`);
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "could not open folder");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    let autoPickedVariant = false;
+
+    function applyEmbeddedDetection(status) {
+      if (status && status.dirs) {
+        const hint = el("embeddedDirsHint");
+        hint.textContent = status.dirs.modelsDir || "";
+        hint.title = `models: ${status.dirs.modelsDir || "?"}\nloras: ${status.dirs.lorasVariantDir || status.dirs.lorasDir || "?"}`;
+      }
+
+      if (!status || !Array.isArray(status.variants)) {
+        return;
+      }
+
+      const select = el("embeddedVariant");
+      el("embeddedLorasReveal").textContent = `loras/${select.value} folder`;
+      const availability = {};
+      for (const item of status.variants) {
+        availability[item.variant] = Array.isArray(item.encodings) ? item.encodings : [];
+      }
+      for (const option of select.options) {
+        const encodings = availability[option.value] || [];
+        option.textContent = encodings.length > 0 ? `${option.value} ✓` : option.value;
+      }
+
+      const current = availability[select.value] || [];
+      if (current.length > 0 && !current.includes(el("embeddedEncoding").value)) {
+        el("embeddedEncoding").value = current[0];
+        persistSettingsSoon();
+        return;
+      }
+
+      if (current.length === 0 && !autoPickedVariant) {
+        const fallback = status.variants.find((item) => item.encodings.length > 0);
+        if (fallback) {
+          autoPickedVariant = true;
+          select.value = fallback.variant;
+          el("embeddedEncoding").value = fallback.encodings.includes("f16") ? "f16" : fallback.encodings[0];
+          persistSettingsSoon();
+          void checkEmbeddedModels();
+          void refreshLorasInPlace();
+        }
+      }
+    }
+
     async function rollDiceInPlace() {
       const button = el("diceButton");
       button.disabled = true;
@@ -179,7 +452,7 @@
       try {
         const loras = activeLoraNames();
         const url = appendQuery("/api/prompts", {
-          backendUrl: value("backendUrl"),
+          ...embeddedOptions(),
           ...(loras.length > 0 ? { lora: loras.join(",") } : {})
         });
 
@@ -229,6 +502,26 @@
       }
 
       return fallback;
+    }
+
+    function healthResponseLooksOnline(response) {
+      if (!response || typeof response !== "object") {
+        return response !== undefined && response !== null;
+      }
+      if (response.success === false || response.online === false) {
+        return false;
+      }
+
+      const status = String(response.status || "").trim().toLowerCase();
+      return !["unhealthy", "failed", "down", "error", "offline"].includes(status);
+    }
+
+    function healthStatusLabel(response) {
+      if (!response || typeof response !== "object") {
+        return "online";
+      }
+
+      return String(response.status || "").trim() || "online";
     }
 
     function renderLoras() {
@@ -306,7 +599,7 @@
 
       try {
         const json = await fetchJsonWithTimeout(appendQuery("/api/loras", {
-          backendUrl: value("backendUrl")
+          ...embeddedOptions()
         }), 8000);
         if (!json.success || !Array.isArray(json.loras)) {
           throw new Error(errorFromResponse(json, "failed to refresh loras"));
@@ -327,9 +620,7 @@
 
     async function checkBackendHealth() {
       try {
-        const json = await fetchJsonWithTimeout(appendQuery("/api/health", {
-          backendUrl: value("backendUrl")
-        }), 3000);
+        const json = await fetchJsonWithTimeout(appendQuery("/api/health", embeddedOptions()), 8000);
         if (!json.success) {
           throw new Error(errorFromResponse(json, "health check failed"));
         }
@@ -380,8 +671,61 @@
       el("replaceSelection").checked = isGenerate || isContinue ? true : Boolean(initial.replaceSelection);
     }
 
+    function setSettingsVisible(visible) {
+      el("mainView").hidden = visible;
+      el("settingsView").hidden = !visible;
+      el("settingsToggle").textContent = visible ? "done" : "settings";
+      if (visible) {
+        void checkBackendHealth();
+        void checkEmbeddedModels();
+        void checkDecoderLora();
+      }
+    }
+
+    function signedDb(value) {
+      const number = Number(value);
+      return `${number >= 0 ? "+" : ""}${number.toFixed(1)} dB`;
+    }
+
+    function updateLoudnessUi() {
+      const normalize = checked("peakNormalize");
+      const limit = checked("limiter");
+      el("peakNormalizeDb").disabled = !normalize;
+      el("limiterCeilingDb").disabled = !limit;
+      el("limiterKnee").disabled = !limit;
+      el("peakNormalizeDbValue").textContent = signedDb(value("peakNormalizeDb"));
+      el("limiterCeilingDbValue").textContent = `${Number(value("limiterCeilingDb")).toFixed(1)} dB`;
+      el("limiterKneeValue").textContent = Number(value("limiterKnee")).toFixed(2);
+    }
+
+    function setLoudnessDefaults(raw) {
+      el("peakNormalize").checked = !raw;
+      el("peakNormalizeDb").value = "2";
+      el("limiter").checked = !raw;
+      el("limiterCeilingDb").value = "-0.3";
+      el("limiterKnee").value = "0.8";
+      updateLoudnessUi();
+      persistSettingsSoon();
+    }
+
     document.addEventListener("DOMContentLoaded", () => {
-      el("backendUrl").value = initial.backendUrl;
+      el("embeddedModelsDir").value = initial.embeddedModelsDir || (initial.embeddedModelStatus && initial.embeddedModelStatus.modelsDir) || "";
+      el("embeddedLorasDir").value = initial.embeddedLorasDir || "";
+      el("embeddedVariant").value = initial.embeddedVariant || (initial.embeddedModelStatus && initial.embeddedModelStatus.variant) || "medium";
+      el("embeddedEncoding").value = initial.embeddedEncoding || (initial.embeddedModelStatus && initial.embeddedModelStatus.encoding) || "f16";
+      el("embeddedDevice").value = initial.embeddedDevice === "cpu" ? "cpu" : "auto";
+      el("keepModelsResident").checked = Boolean(initial.keepModelsResident);
+      el("decoderLoraEnabled").checked = decoderPreference;
+      el("peakNormalize").checked = initial.peakNormalize !== false;
+      el("peakNormalizeDb").value = String(initial.peakNormalizeDb);
+      el("limiter").checked = initial.limiter !== false;
+      el("limiterCeilingDb").value = String(initial.limiterCeilingDb);
+      el("limiterKnee").value = String(initial.limiterKnee);
+      const initialEndingMode = operation() === "continue"
+        ? initial.continuationEndingMode
+        : initial.generationEndingMode;
+      const ending = document.querySelector(`input[name="endingMode"][value="${initialEndingMode === "ends-here" ? "ends-here" : "keeps-going"}"]`);
+      if (ending) ending.checked = true;
       el("prompt").value = initial.prompt;
       el("strength").value = String(initial.strength);
       el("strengthValue").textContent = Number(initial.strength).toFixed(2);
@@ -398,26 +742,61 @@
       el("selection").textContent = initial.selectionLabel;
       el("music").textContent = [initial.tempoLabel, initial.keyScaleLabel].filter(Boolean).join(" / ");
       setStatus(initial.statusMessage || "");
+      renderEmbeddedModelStatus(initial.embeddedModelStatus);
       configureForOperation();
-      updateBackendModeUi();
+      setSettingsVisible(false);
+      updateLoudnessUi();
 
       renderLoras();
       void checkBackendHealth();
+      void checkEmbeddedModels();
+      void checkDecoderLora();
 
       el("shell").addEventListener("input", persistSettingsSoon);
       el("shell").addEventListener("change", persistSettingsSoon);
       el("strength").addEventListener("input", (event) => {
         el("strengthValue").textContent = Number(event.target.value).toFixed(2);
       });
-      el("backendToggle").addEventListener("click", resetBackendToLocal);
-      el("backendUrl").addEventListener("change", () => {
-        updateBackendModeUi();
-        void checkBackendHealth();
-        void refreshLorasInPlace();
+      for (const id of ["embeddedModelsDir", "embeddedLorasDir", "embeddedVariant", "embeddedEncoding"]) {
+        el(id).addEventListener("change", () => {
+          renderEmbeddedModelStatus(null);
+          void checkEmbeddedModels();
+          void checkBackendHealth();
+          void refreshLorasInPlace();
+          void checkDecoderLora();
+        });
+      }
+      el("embeddedModelsCheck").addEventListener("click", () => {
+        setEmbeddedModelStatus("checking...", "pending");
+        void checkEmbeddedModels();
       });
+      el("embeddedModelsReveal").addEventListener("click", () => {
+        void revealEmbeddedFolder("models");
+      });
+      el("embeddedLorasReveal").addEventListener("click", () => {
+        void revealEmbeddedFolder("loras");
+      });
+      el("embeddedModelsDownload").addEventListener("click", () => {
+        void downloadOrCancelEmbeddedModels();
+      });
+      el("decoderDownload").addEventListener("click", () => {
+        void downloadOrCancelDecoderLora();
+      });
+      el("decoderLoraEnabled").addEventListener("change", () => {
+        decoderPreference = checked("decoderLoraEnabled");
+      });
+      for (const id of ["peakNormalize", "peakNormalizeDb", "limiter", "limiterCeilingDb", "limiterKnee"]) {
+        el(id).addEventListener("input", updateLoudnessUi);
+        el(id).addEventListener("change", updateLoudnessUi);
+      }
+      el("loudnessDefaults").addEventListener("click", () => setLoudnessDefaults(false));
+      el("loudnessRaw").addEventListener("click", () => setLoudnessDefaults(true));
       el("healthCheck").addEventListener("click", () => {
         setHealth("checking...", "pending");
         void checkBackendHealth();
+      });
+      el("settingsToggle").addEventListener("click", () => {
+        setSettingsVisible(el("settingsView").hidden);
       });
       el("useLoras").addEventListener("change", updateLoraVisibility);
       el("useSeed").addEventListener("change", updateSeedEnabled);
@@ -477,6 +856,13 @@
       gap: 10px;
     }
 
+    [hidden] { display: none !important; }
+
+    .view {
+      display: grid;
+      gap: 10px;
+    }
+
     .title-row,
     .meta-row {
       display: flex;
@@ -513,7 +899,10 @@
     .wide { grid-column: span 2; }
 
     .continue-only { display: none; }
+    .generate-or-continue-only { display: none; }
     .shell[data-operation="continue"] .continue-only { display: grid; }
+    .shell[data-operation="continue"] .generate-or-continue-only,
+    .shell[data-operation="generate"] .generate-or-continue-only { display: grid; }
     .shell[data-operation="continue"] .transform-only { display: none; }
     .shell[data-operation="generate"] .transform-only { display: none; }
 
@@ -557,12 +946,64 @@
       min-width: 0;
     }
 
-    .backend-row {
+    .embedded-model-row {
       display: grid;
-      grid-template-columns: 68px 1fr 58px minmax(96px, 126px);
+      grid-template-columns: minmax(140px, 1.5fr) minmax(90px, 1fr) minmax(90px, 1fr);
+      align-items: end;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .settings-actions,
+    .runtime-row,
+    .decoder-row {
+      display: flex;
       align-items: center;
       gap: 6px;
       min-width: 0;
+    }
+
+    .settings-actions button {
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+
+    .runtime-row .health-status,
+    .decoder-row .check-row { flex: 1 1 auto; }
+
+    .settings-view { gap: 12px; }
+
+    .settings-section {
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid #242424;
+      background: #323232;
+    }
+
+    .settings-heading {
+      color: var(--text);
+      font-weight: 700;
+    }
+
+    .path-hint {
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .loudness-control {
+      display: grid;
+      grid-template-columns: 48px minmax(140px, 1fr) 58px;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .value-label {
+      color: var(--muted);
+      text-align: right;
+      white-space: nowrap;
     }
 
     .health-status {
@@ -576,6 +1017,20 @@
     .health-status[data-state="online"] { color: #8fd484; }
     .health-status[data-state="offline"] { color: #ff7d6e; }
     .health-status[data-state="pending"] { color: var(--accent); }
+
+    .model-status {
+      min-width: 0;
+      height: 22px;
+      line-height: 22px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .model-status[data-state="online"] { color: #8fd484; }
+    .model-status[data-state="offline"] { color: #ff7d6e; }
+    .model-status[data-state="pending"] { color: var(--accent); }
 
     .range-row {
       display: grid;
@@ -647,6 +1102,36 @@
       display: grid;
       gap: 8px;
       padding-top: 6px;
+    }
+
+    .ending-control {
+      gap: 5px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #242424;
+    }
+
+    .segmented {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+
+    .segmented label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 24px;
+      padding: 0 8px;
+      border: 1px solid var(--border);
+      background: var(--control);
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .segmented input {
+      width: 13px;
+      height: 13px;
+      accent-color: var(--accent);
     }
 
     .advanced-header {
@@ -725,92 +1210,190 @@
   <div class="shell" id="shell">
     <div class="title-row">
       <h1 id="title">SA3 Transform</h1>
-      <div class="selection" id="selection"></div>
+      <button id="settingsToggle" type="button">settings</button>
     </div>
-    <div class="meta-row">
-      <div class="music" id="music"></div>
+    <input id="embeddedModelsDir" type="hidden">
+    <input id="embeddedLorasDir" type="hidden">
+
+    <section class="view" id="mainView">
+      <div class="meta-row">
+        <div class="selection" id="selection"></div>
+        <div class="music" id="music"></div>
+      </div>
+      <div class="grid">
+        <label class="full">
+          prompt
+          <div class="prompt-row">
+            <input id="prompt" type="text" placeholder="warm shoegaze guitars">
+            <button id="diceButton" type="button" title="roll prompt">dice</button>
+          </div>
+        </label>
+        <label class="wide transform-only">
+          init noise
+          <div class="range-row">
+            <input id="strength" type="range" min="0.01" max="1" step="0.01">
+            <span id="strengthValue"></span>
+          </div>
+        </label>
+        <label class="wide continue-only">
+          add bars
+          <input id="continueBars" type="number" min="0.25" max="256" step="0.25">
+        </label>
+        <label>
+          steps
+          <input id="steps" type="number" min="4" max="16" step="1">
+        </label>
+        <label>
+          cfg
+          <input id="cfgScale" type="number" min="0.5" max="2" step="0.1">
+        </label>
+        <label>
+          shift
+          <select id="shift">
+            <option value="full">full</option>
+            <option value="default">default</option>
+            <option value="none">none</option>
+            <option value="logsnr">logsnr</option>
+            <option value="flux">flux</option>
+          </select>
+        </label>
+        <div class="seed-cell">
+          <label class="check-row">
+            <input id="useSeed" type="checkbox">
+            seed
+          </label>
+          <input id="seed" type="number" step="1" placeholder="random">
+          <div class="seed-note" id="lastSeed"></div>
+        </div>
+        <label class="wide">
+          negative
+          <input id="negativePrompt" type="text" placeholder="low quality">
+        </label>
+        <label class="check-row full transform-only">
+          <input id="replaceSelection" type="checkbox">
+          replace selection
+        </label>
+      </div>
+      <details id="advanced">
+        <summary>advanced</summary>
+        <div class="advanced-grid">
+          <div class="ending-control generate-or-continue-only">
+            <span>ending</span>
+            <div class="segmented">
+              <label><input type="radio" name="endingMode" value="ends-here"> ends here</label>
+              <label><input type="radio" name="endingMode" value="keeps-going"> keeps going</label>
+            </div>
+            <span class="muted">“keeps going” composes 6 seconds past the clip before trimming</span>
+          </div>
+          <div class="advanced-header">
+            <label class="check-row">
+              <input id="useLoras" type="checkbox">
+              use loras
+            </label>
+            <button id="refreshLoras" type="button">refresh</button>
+          </div>
+          <div class="lora-rows" id="loraRows"></div>
+        </div>
+      </details>
       <div class="status" id="loraStatus"></div>
-    </div>
-    <div class="grid">
-      <label class="full">
-        backend
-        <div class="backend-row">
-          <button id="backendToggle" type="button">local</button>
-          <input id="backendUrl" type="text" spellcheck="false">
+      <div class="buttons">
+        <button id="cancelButton" type="button">Cancel</button>
+        <button id="actionButton" class="primary" type="button">Transform</button>
+      </div>
+    </section>
+
+    <section class="view settings-view" id="settingsView" hidden>
+      <div class="settings-section">
+        <div class="settings-heading">embedded runtime</div>
+        <div class="runtime-row">
           <button id="healthCheck" type="button">check</button>
           <div class="health-status" id="healthStatus"></div>
         </div>
-      </label>
-      <label class="full">
-        prompt
-        <div class="prompt-row">
-          <input id="prompt" type="text" placeholder="warm shoegaze guitars">
-          <button id="diceButton" type="button" title="roll prompt">dice</button>
-        </div>
-      </label>
-      <label class="wide transform-only">
-        init noise
-        <div class="range-row">
-          <input id="strength" type="range" min="0.01" max="1" step="0.01">
-          <span id="strengthValue"></span>
-        </div>
-      </label>
-      <label class="wide continue-only">
-        duration (bars)
-        <input id="continueBars" type="number" min="0.25" max="256" step="0.25">
-      </label>
-      <label>
-        steps
-        <input id="steps" type="number" min="4" max="16" step="1">
-      </label>
-      <label>
-        cfg
-        <input id="cfgScale" type="number" min="0.5" max="2" step="0.1">
-      </label>
-      <label>
-        shift
-        <select id="shift">
-          <option value="full">full</option>
-          <option value="default">default</option>
-          <option value="none">none</option>
-          <option value="logsnr">logsnr</option>
-          <option value="flux">flux</option>
-        </select>
-      </label>
-      <div class="seed-cell">
-        <label class="check-row">
-          <input id="useSeed" type="checkbox">
-          seed
-        </label>
-        <input id="seed" type="number" step="1" placeholder="random">
-        <div class="seed-note" id="lastSeed"></div>
       </div>
-      <label class="wide">
-        negative
-        <input id="negativePrompt" type="text" placeholder="low quality">
-      </label>
-      <label class="check-row full transform-only">
-        <input id="replaceSelection" type="checkbox">
-        replace selection
-      </label>
-    </div>
-    <details id="advanced">
-      <summary>advanced</summary>
-      <div class="advanced-grid">
-        <div class="advanced-header">
-          <label class="check-row">
-            <input id="useLoras" type="checkbox">
-            use loras
+      <div class="settings-section">
+        <div class="settings-heading">generation model</div>
+        <div class="embedded-model-row">
+          <label>
+            model
+            <select id="embeddedVariant">
+              <option value="medium">medium</option>
+              <option value="small-music">small-music</option>
+              <option value="small-sfx">small-sfx</option>
+            </select>
           </label>
-          <button id="refreshLoras" type="button">refresh</button>
+          <label>
+            encoding
+            <select id="embeddedEncoding">
+              <option value="f16">f16</option>
+              <option value="f32">f32</option>
+            </select>
+          </label>
+          <label>
+            device
+            <select id="embeddedDevice" title="auto uses the GPU when the build has one; cpu forces CPU">
+              <option value="auto">auto</option>
+              <option value="cpu">cpu</option>
+            </select>
+          </label>
         </div>
-        <div class="lora-rows" id="loraRows"></div>
+        <div class="settings-actions">
+          <button id="embeddedModelsCheck" type="button">check</button>
+          <button id="embeddedModelsDownload" type="button">download</button>
+          <button id="embeddedModelsReveal" type="button">models folder</button>
+          <button id="embeddedLorasReveal" type="button">loras folder</button>
+        </div>
+        <div class="model-status" id="embeddedModelsStatus"></div>
+        <div class="path-hint" id="embeddedDirsHint"></div>
+        <label class="check-row">
+          <input id="keepModelsResident" type="checkbox">
+          keep models resident
+          <span class="muted">faster repeat runs, but continues occupying the selected device</span>
+        </label>
       </div>
-    </details>
-    <div class="buttons">
-      <button id="cancelButton" type="button">Cancel</button>
-      <button id="actionButton" class="primary" type="button">Transform</button>
-    </div>
+      <div class="settings-section decoder-card">
+        <div class="settings-heading">SAME-L decoder correction</div>
+        <div class="decoder-row">
+          <label class="check-row">
+            <input id="decoderLoraEnabled" type="checkbox">
+            use decoder correction
+          </label>
+          <button id="decoderDownload" type="button">download</button>
+        </div>
+        <div class="model-status" id="decoderStatus"></div>
+        <div class="muted">Reduces high-frequency buildup in transforms and continuations. Medium / SAME-L only.</div>
+      </div>
+      <div class="settings-section loudness-card">
+        <div class="settings-heading">output processing</div>
+        <div class="muted">Practical loudness controls applied after decoding.</div>
+        <label class="check-row">
+          <input id="peakNormalize" type="checkbox">
+          peak normalize
+        </label>
+        <label class="loudness-control">
+          <span>target</span>
+          <input id="peakNormalizeDb" type="range" min="-6" max="6" step="0.1">
+          <span class="value-label" id="peakNormalizeDbValue"></span>
+        </label>
+        <label class="check-row">
+          <input id="limiter" type="checkbox">
+          soft limiter
+        </label>
+        <label class="loudness-control">
+          <span>ceiling</span>
+          <input id="limiterCeilingDb" type="range" min="-6" max="0" step="0.1">
+          <span class="value-label" id="limiterCeilingDbValue"></span>
+        </label>
+        <label class="loudness-control">
+          <span>knee</span>
+          <input id="limiterKnee" type="range" min="0.1" max="1" step="0.01">
+          <span class="value-label" id="limiterKneeValue"></span>
+        </label>
+        <div class="settings-actions">
+          <button id="loudnessDefaults" type="button">tuned defaults</button>
+          <button id="loudnessRaw" type="button">raw</button>
+        </div>
+      </div>
+    </section>
   </div>
 </body>
 </html>

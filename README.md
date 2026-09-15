@@ -2,71 +2,171 @@
 
 stable audio 3 generation, transformation, and continuation directly inside Ableton Live arrangement selections.
 
-> **update:** this repo now contains a [very experimental branch](https://github.com/betweentwomidnights/sa3-ableton-extension/tree/backends/embedded-sa3) where we are embedding stable audio 3 directly into the extension with the `libsa3` from [sa3.cpp](https://github.com/betweentwomidnights/sa3.cpp) — no separate backend process. it's still in heavy testing (CUDA / VULKAN / and very shortly Metal builds).
+> ## embedded sa3.cpp v0.2.0
 >
-> if you just want to use the local http requests with pytorch, just grab the `.ablx` in the `main` branch here.
+> this version embeds [sa3.cpp](https://github.com/betweentwomidnights/sa3.cpp) directly through its V1 C ABI. there is no backend URL or separate server process.
+>
+> Windows CUDA and Vulkan packages are supported. **TODO:** we need a macOS user to produce and test the Metal package before calling that build supported.
+>
+> install the appropriate `.ablx` with Developer Mode **off** in Ableton Live beta.
 
-**UPDATE:** oops, i misunderstood how easy it was to use just the `.ablx` file if you disable developer mode. if you only want to use the extension, install [gary-extension.ablx](releases/gary-extension.ablx) inside Ableton Live beta with Developer Mode off.
+The former Python/server-backed extension is preserved on the
+[`legacy/python-server`](https://github.com/betweentwomidnights/sa3-ableton-extension/tree/legacy/python-server)
+branch for existing users and historical reference.
 
-fair warning...you still need an SA3 backend while generating, either Gary4local or the backend in this repo. but you do not need to run the Ableton extension host from a terminal unless you're building on top of this.
+## embedded sa3.cpp backend
 
-2nd warning...untested on macOS. plz let me know if it works/doesn't work on apple silicon.
+the extension embeds `sa3.cpp` directly as a native node addon — no separate backend process or backend URL to configure.
 
-this is an early V1 built against the Ableton Extensions SDK beta. the long-term idea is much larger: model workflows that feel native inside Live instead of forcing the user to leave the DAW, record into a plugin, drag files around, or manually line generated audio back up on the timeline. for now, this repo is intentionally focused on stable audio 3.
+### builds (cuda / vulkan / cpu)
 
-## what it do
+the addon itself is backend-agnostic — it `LoadLibrary`s `sa3.dll` at runtime and resolves the versioned C ABI V1 table through `sa3_get_api`, so the only difference between builds is which `ggml` runtime DLLs are bundled next to it. three flavours:
 
-the extension adds three right-click actions on audio-track arrangement selections:
+| backend | build script | bundled runtime | .ablx size | notes |
+| --- | --- | --- | --- | --- |
+| cuda   | `npm run package:cuda`   | `ggml-cuda` + CUDA runtime (`cublas*`, `cudart*`) | ~600 MB | fastest on NVIDIA; huge because of the CUDA runtime |
+| vulkan | `npm run package:vulkan` | `ggml-vulkan` | ~15 MB | runs on any Vulkan GPU (NVIDIA/AMD/Intel); needs the system Vulkan loader (`vulkan-1.dll`, ships with GPU drivers). basically as fast as CUDA for this workload |
+| cpu    | `npm run package:cpu`    | static `ggml-cpu` | ~3 MB | no GPU needed. slow for `medium`, genuinely usable for `small-music` |
+| metal  | `npm run package:metal`  | `libsa3.dylib` + `ggml` dylibs (`ggml-metal`, `ggml-blas`, `ggml-cpu`, `ggml-base`) | ~15 MB | **macOS / Apple Silicon only**. uses the Metal GPU backend; the Metal shaders are embedded in `libggml-metal.dylib` (no separate `.metallib`). the packager rewrites the dylib rpaths to `@loader_path` and re-adhoc-signs them so the extension host can `dlopen` them |
 
-- `Gary SA3: Transform Selection`
-- `Gary SA3: Continue Selection`
-- `Gary SA3: Generate Selection`
+`npm run package:all` builds all three Windows flavours in one pass (compiling the addon once). outputs land in `dist/gary-extension-<backend>.ablx` (also copied into the gitignored `releases/`). the backend is selected at build time with `GARY_SA3_BACKEND=cuda|vulkan|cpu|metal`, mapping to the `sa3.cpp/build-cuda`, `build-vulkan`, `build`, and `build-metal` runtime dirs respectively. `metal` is macOS-only (`npm run package:metal`); the Windows `package:all` does not include it.
 
-transform renders the selected audio range, sends it to an SA3 backend, and replaces the selected region by default.
+> the CPU build uses the plain static `build/` (where `ggml-cpu.dll` is a direct
+> dependency and loads from the addon dir). the `build-cpu-variants` tree
+> (`GGML_BACKEND_DL` runtime CPU-variant selection) is **CLI-only** — its
+> `ggml-cpu-*.dll` are discovered from the process dir, which the extension host
+> can't satisfy, so it aborts when embedded. keep it for `sa3-generate`
+> benchmarking, not for packaging.
 
-continue renders the selected audio range, asks SA3 for a longer inpaint continuation, and replaces from the selection start with the returned source-plus-continuation clip.
+note: all three share the extension id `gary.gary-extension`, so only one can be installed at a time — installing a second replaces the first.
 
-generate uses the selected arrangement duration to create audio from text and places the result at the selected start.
+> performance is variable, especially on vulkan. the vulkan backend compiles
+> compute shaders on first use, so the *first* init-audio transform/continue
+> after install can take several extra seconds while pipelines build and get
+> cached by the GPU driver; later runs are fast. speed also depends on power
+> state (keep the laptop plugged in — battery throttles the GPU hard) and on
+> GPU contention from screen capture/encoding (e.g. OBS). for init-audio-heavy
+> work on NVIDIA, the cuda build is the most consistent. this is all still
+> experimental.
 
-ableton's undo restores the previous timeline state, which makes the replace workflow feel surprisingly natural.
+### building from source
 
-## backend
-
-this repo is local-first. The public branch defaults to:
+the addon compiles against `sa3.cpp` headers and bundles that project's runtime
+(`sa3.dll` + `ggml` DLLs on Windows; `libsa3.dylib` + `ggml` dylibs on macOS), so
+**`sa3.cpp` must be checked out next to this repo** (a sibling directory), or
+point `SA3_CPP_DIR` at it:
 
 ```text
-http://localhost:8006
+<parent>/
+  sa3.cpp/                  <- https://github.com/betweentwomidnights/sa3.cpp
+  sa3-ableton-extension/    <- this repo
 ```
 
-the dialog keeps an editable backend URL field, so you can point it at any compatible SA3 server you control.
+prerequisites:
 
-tested today with the Gary4local companion app:
+- Node 20+, and the Ableton Extensions SDK/CLI tarballs in [vendor/](vendor/) (then `npm install`)
+- **Windows**: Visual Studio 2022 with the C++ toolchain (node-gyp compiles the native addon)
+- **macOS**: the Xcode command-line tools (`xcode-select --install`) for clang + `install_name_tool`/`codesign`
+- **cuda** build: the CUDA Toolkit with `CUDA_PATH` set — the packager copies `cudart*`/`cublas*` from `%CUDA_PATH%\bin`
+- **vulkan** build: the Vulkan SDK (needed to build `sa3.cpp`; running only needs the driver's `vulkan-1.dll`)
+- **metal** build: macOS on Apple Silicon; nothing extra beyond the Xcode CLT (Metal ships with the OS)
 
-https://github.com/betweentwomidnights/gary-localhost-installer
+**1. build the sa3.cpp runtime** for the backend(s) you want, from the `sa3.cpp` dir:
 
-the standalone backend in [backend/](backend/) was extracted from Gary4local's `services/sa3/api.py` so people can run a small API wrapper around their existing official Stable Audio 3 checkout. The goal is to stay as close as possible to upstream:
+```bat
+build.cmd cuda      :: -> build-cuda/    (Windows)
+build.cmd vulkan    :: -> build-vulkan/  (Windows)
+build.cmd cpu       :: -> build/         (the static CPU build the extension packages)
+```
 
-https://github.com/Stability-AI/stable-audio-3
+```bash
+./build.sh metal    #  -> build-metal/   (macOS)
+```
 
-if you do not have a suitable GPU and want hosted access, open an issue or reach out. you can use our remote backend if you ask nicely, and if you're clever enough, you'll figure out how gary4juce talks to it anyway.
+**2. package the extension**, from this repo:
 
-## backend contract
+```bash
+npm install
+npm run package:cuda     # Windows: or package:vulkan / package:cpu / package:all
+npm run package:metal    # macOS
+```
 
-the extension expects an SA3-compatible HTTP backend with:
+each `.ablx` lands in `dist/` (and the gitignored `releases/`). `GARY_SA3_BACKEND`
+selects which `sa3.cpp` build dir is bundled (`cuda`->`build-cuda`,
+`vulkan`->`build-vulkan`, `cpu`->`build`, `metal`->`build-metal`); override the
+location with `SA3_CPP_DIR` if your checkout isn't the sibling default. on macOS
+the packager copies `libsa3.dylib` and its `ggml` dylib dependencies flat next to
+the addon, rewrites their rpaths to `@loader_path`, and re-adhoc-signs them.
 
-- `GET /health`
-- `GET /loras`
-- `GET /prompts`
-- `POST /generate`
-- `POST /transform`
-- `POST /continue`
-- `GET /poll_status/<session_id>`
+to iterate in Ableton's dev host without repackaging each time, `npm run start:win`
+runs the extension unsandboxed against a local Live install — set
+`EXTENSION_HOST_PATH` in `.env` to your Live beta path first.
 
-the local backend also preserves useful output-shaping environment variables from gary4local, including latent scaling, peak normalization, and a gentle limiter. these handle some of the loudness issues i get from my loras.
+### device toggle (auto / cpu)
 
-backend extraction is now in [backend/](backend/). start with [backend/README.md](backend/README.md); the local SA3 setup uses `uv` and installs the official upstream stable audio 3 repo into the backend venv.
+the dialog's **settings** view has a **device** dropdown:
 
-LoRA setup is documented in [backend/LORAS.md](backend/LORAS.md), including registry JSON, prompt dice files, and API checks.
+- `auto` — use the GPU if the build has one (cuda/vulkan), else CPU.
+- `cpu` — force the CPU backend, even on a GPU build (both the cuda and vulkan builds bundle `ggml-cpu.dll`, so this always works).
+
+switching device recreates the libsa3 context on the next generation. handy for A/B-ing GPU vs CPU, and CPU is genuinely usable for `small-music`.
+
+**keep models resident** is off by default. leave it off to release the model allocation after each job, or enable it for faster repeated generations when the extra GPU/CPU memory use is acceptable.
+
+under the hood this sets `sa3_context_config_v1.device`; the CLI's `SA3_DEVICE=cpu` / `SA3_GPU=<index-or-name>` env vars still work as the fallback when no explicit device is passed.
+
+### the sandbox (why there is no file picker)
+
+when an `.ablx` is installed normally (Developer Mode off), Live launches the extension host with node's permission model enabled. the extension's javascript can only read/write:
+
+- `%LOCALAPPDATA%\Ableton\Extensions` (the installed extension itself)
+- `%LOCALAPPDATA%\Ableton\Extensions Data\gary.gary-extension` (per-extension data)
+- `%LOCALAPPDATA%\Temp\Ableton Extensions`
+
+any other path — your `C:\dev\sa3.cpp\models`, your Downloads folder, anywhere — throws `ERR_ACCESS_DENIED` at the fs layer. that is why there is no "browse for models folder" button: a picked path outside the sandbox would be unreadable anyway. instead, the dialog has **models folder** / **loras folder** reveal buttons that open the sandbox locations in Explorer so you can copy files in.
+
+developer mode (`npm start`) runs the host unsandboxed, so external paths work there. don't be fooled while testing.
+
+### models
+
+press **download** in the dialog to fetch the selected variant (`medium`, `small-music`, `small-sfx`) from Hugging Face into `Extensions Data\gary.gary-extension\models`. variants that are fully present are marked with a ✓ in the variant dropdown, and the extension auto-selects an available variant on open if the current one is missing.
+
+already have the ggufs? press **models folder** and copy them in. the checker matches files by prefix/suffix glob (e.g. `stable-audio-3-medium-dit-*-F16.gguf`), so upstream version bumps in filenames are fine.
+
+### loras
+
+loras are base-model specific, so they live under a **variant subfolder** and are only listed when that variant is selected. the reveal button is labelled for the current variant (e.g. **loras/medium folder**) and opens exactly the right place. drop each lora in as its own subfolder, the way a training run leaves it:
+
+```text
+loras/
+  medium/
+    kev/
+      kev.safetensors    <- required
+      kev.json           <- required (adapter metadata)
+      *.txt              <- optional: one caption per file, feeds the dice button
+    keygen/
+      ...
+  small-music/
+    <loras trained on small-music>
+```
+
+so a `medium` lora is not offered while `small-music` is selected, and vice versa. detection is automatic — no import step. the first time a lora is used for generation it is converted to gguf next to its safetensors (`kev/kev-f32.gguf`) and reused after that (reconverted if the safetensors is newer). a plain `lora-<name>-f32.gguf` dropped into the variant folder also works.
+
+the `.txt` files are the captions from your training dataset. when a lora is active, the **dice** button rolls prompts from those captions instead of the generic pool. no txt files means dice falls back to the built-in generic pool and reports the lora pool as missing.
+
+prefix a lora folder with `_` or `.` to disable it without deleting it.
+
+a future idea is a hugging face lora registry with a "download loras" button; for now, copy folders in by hand.
+
+### decoder correction
+
+the settings view can download and toggle the published `squeakfix_v3` decoder correction. it is applied at strength 1 only when the selected generation model is `medium` (SAME-L). the preference remains saved while a SAME-S model is selected, but the adapter is never passed to an incompatible small model.
+
+the advanced **ends here / keeps going** setting controls V1's tail padding for generate and continue. **ends here** uses zero seconds so the model plans an ending at the clip boundary; **keeps going** generates six seconds beyond the requested clip and trims the extra audio, so the requested boundary can remain in full motion.
+
+### output processing
+
+the settings view exposes the same post-decode loudness controls as the iPlug2 frontend: peak normalization with a -6 to +6 dB target, and a soft limiter with a -6 to 0 dB ceiling and 0.1 to 1.0 knee. **tuned defaults** restores normalize on at +2.0 dB and limiter on at -0.3 dB / 0.8 knee; **raw** disables both stages. latent rescale and latent shift intentionally remain at neutral values and are not exposed.
 
 ## ableton beta sequence
 
@@ -76,12 +176,12 @@ this is the path if you just want to use the extension:
 
 1. Download the Ableton Live beta from:
    https://ableton.github.io/extensions-sdk/
-2. Download [gary-extension.ablx](releases/gary-extension.ablx) from this repo.
+2. Download the latest `.ablx` from [Releases](https://github.com/betweentwomidnights/sa3-ableton-extension/releases).
 3. Open Ableton Live beta.
 4. In Preferences -> Extensions, make sure Developer Mode is disabled.
 5. Install the `.ablx` extension from Live's extension UI.
 6. Restart Ableton Live beta if the menu entries do not appear.
-7. Make sure an SA3 backend is running at `http://localhost:8006`, or edit the backend URL in the extension dialog.
+7. Open a Generate, Transform, or Continue command; the bundled `sa3.cpp` runtime is checked automatically.
 
 ### developer mode
 

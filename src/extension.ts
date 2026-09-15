@@ -9,17 +9,39 @@ import {
 } from "@ableton-extensions/sdk";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
+import * as os from "node:os";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 import transformDialog from "./transform-dialog.html";
+import {
+  availableEmbeddedVariants,
+  cancelEmbeddedDecoderLoraDownload,
+  cancelEmbeddedModelDownload,
+  defaultEmbeddedLorasDir,
+  defaultEmbeddedModelsDir,
+  embeddedDicePrompts,
+  embeddedDownloadStatus,
+  embeddedDecoderLoraStatus,
+  embeddedEffectiveDirs,
+  embeddedModelStatus,
+  embeddedSa3Diagnostics,
+  listEmbeddedLoras,
+  runEmbeddedSa3,
+  startEmbeddedDecoderLoraDownload,
+  startEmbeddedModelDownload,
+  type EmbeddedModelOptions,
+  type EmbeddedModelStatus,
+  type EmbeddedSa3Request,
+} from "./embedded-sa3.js";
 
 const API_VERSION = "1.0.0";
 const COMMAND_TRANSFORM_SELECTION = "gary.sa3.transformSelection";
 const COMMAND_CONTINUE_SELECTION = "gary.sa3.continueSelection";
 const COMMAND_GENERATE_SELECTION = "gary.sa3.generateSelection";
-const DEFAULT_LOCAL_SA3_URL = "http://localhost:8006";
+const SA3_CPP_TAIL_PAD_SECONDS = 6.0;
 let warnedMissingStorageDirectory = false;
 let warnedSettingsWriteFailure = false;
 let inMemorySettings: TransformSettings | undefined;
@@ -28,7 +50,20 @@ type Context = ExtensionContext<typeof API_VERSION>;
 type SelectionOperation = "transform" | "continue" | "generate";
 
 interface TransformSettings {
-  backendUrl: string;
+  embeddedModelsDir: string;
+  embeddedLorasDir: string;
+  embeddedVariant: string;
+  embeddedEncoding: string;
+  embeddedDevice: string;
+  keepModelsResident: boolean;
+  decoderLoraEnabled: boolean;
+  generationEndingMode: "ends-here" | "keeps-going";
+  continuationEndingMode: "ends-here" | "keeps-going";
+  peakNormalize: boolean;
+  peakNormalizeDb: number;
+  limiter: boolean;
+  limiterCeilingDb: number;
+  limiterKnee: number;
   prompt: string;
   strength: number;
   steps: number;
@@ -60,7 +95,7 @@ interface DialogInitial extends TransformSettings {
   beatsPerBar: number;
   tempoLabel: string;
   keyScaleLabel: string;
-  localBackendUrl: string;
+  embeddedModelStatus: EmbeddedModelStatus;
   availableLoras: string[];
   statusMessage: string;
 }
@@ -76,30 +111,26 @@ interface DicePromptResult {
   missingLoras: string[];
 }
 
-interface BackendHealth {
-  online: boolean;
-  status: string;
-}
-
-interface PollStatus {
-  success?: boolean;
-  status?: string;
-  progress?: number;
-  audio_data?: string;
-  error?: string;
-  errors?: unknown[];
-  meta?: {
-    seed?: number | string;
-  };
-}
-
 interface TransformResult {
   filePath: string;
   seed?: string;
 }
 
 const defaultSettings: TransformSettings = {
-  backendUrl: DEFAULT_LOCAL_SA3_URL,
+  embeddedModelsDir: "",
+  embeddedLorasDir: "",
+  embeddedVariant: "medium",
+  embeddedEncoding: "f16",
+  embeddedDevice: "auto",
+  keepModelsResident: false,
+  decoderLoraEnabled: true,
+  generationEndingMode: "keeps-going",
+  continuationEndingMode: "keeps-going",
+  peakNormalize: true,
+  peakNormalizeDb: 2.0,
+  limiter: true,
+  limiterCeilingDb: -0.3,
+  limiterKnee: 0.8,
   prompt: "",
   strength: 0.9,
   steps: 8,
@@ -121,21 +152,21 @@ export function activate(activation: ActivationContext) {
   context.commands.registerCommand(COMMAND_TRANSFORM_SELECTION, (arg: unknown) => {
     console.log("[gary-sa3] transform command invoked");
     void processSelection(context, arg as ArrangementSelection, "transform").catch((error) => {
-      console.error("[gary-sa3] transform failed", error);
+      void handleCommandError(context, "transform", error);
     });
   });
 
   context.commands.registerCommand(COMMAND_CONTINUE_SELECTION, (arg: unknown) => {
     console.log("[gary-sa3] continue command invoked");
     void processSelection(context, arg as ArrangementSelection, "continue").catch((error) => {
-      console.error("[gary-sa3] continue failed", error);
+      void handleCommandError(context, "continue", error);
     });
   });
 
   context.commands.registerCommand(COMMAND_GENERATE_SELECTION, (arg: unknown) => {
     console.log("[gary-sa3] generate command invoked");
     void processSelection(context, arg as ArrangementSelection, "generate").catch((error) => {
-      console.error("[gary-sa3] generate failed", error);
+      void handleCommandError(context, "generate", error);
     });
   });
 
@@ -200,10 +231,10 @@ async function processSelection(
   const storedSettings = await readStoredSettings(context);
   const musicContext = getMusicContext(context);
   const selectionBeats = endBeat - startBeat;
-  let settings = sanitizeSettings({
+  let settings = settingsWithEmbeddedDefaults(context, sanitizeSettings({
     ...defaultSettings,
     ...storedSettings,
-  });
+  }));
   const initialSettings = settings;
   if (operation === "continue" && settings.continueBeats <= 0) {
     settings = {
@@ -211,7 +242,7 @@ async function processSelection(
       continueBeats: clamp(selectionBeats, 0.25, 1024),
     };
   }
-  let loraNames = await fetchAvailableLoras(settings.backendUrl);
+  let loraNames = await fetchAvailableLoras(embeddedOptionsFromSettings(settings));
   let statusMessage = loraStatusMessage(loraNames);
   const selectionLabel = `${tracks.length} track${tracks.length === 1 ? "" : "s"} / ${formatBeatBarDuration(selectionBeats, musicContext.beatsPerBar)}`;
 
@@ -229,13 +260,13 @@ async function processSelection(
     if (dialogResult.settings) {
       await writeStoredSettings(
         context,
-        settingsForStorage(initialSettings, sanitizeSettings(dialogResult.settings), operation),
+        settingsForStorage(initialSettings, settingsWithEmbeddedDefaults(context, sanitizeSettings(dialogResult.settings)), operation),
       );
     }
     return;
   }
 
-  settings = sanitizeSettings(dialogResult.settings);
+  settings = settingsWithEmbeddedDefaults(context, sanitizeSettings(dialogResult.settings));
   if (operation === "continue" && settings.continueBeats <= 0) {
     settings = {
       ...settings,
@@ -264,7 +295,10 @@ async function processSelection(
       let sourceWavPath = "";
       if (operation !== "generate") {
         await update(`${prefix}rendering ${track.name}`, (i / tracks.length) * 100);
+        console.log(`[gary-sa3] rendering ${operation} source: track="${track.name}" beats=${startBeat}-${endBeat}`);
         sourceWavPath = await context.resources.renderPreFxAudio(track, startBeat, endBeat);
+        const sourceInfo = await fs.stat(sourceWavPath);
+        console.log(`[gary-sa3] rendered source wav: ${sourceWavPath} (${sourceInfo.size} bytes)`);
         signal.throwIfAborted();
       }
 
@@ -284,6 +318,7 @@ async function processSelection(
           settings,
           sourceWavPath,
           musicContext,
+          beatsToSeconds(selectionBeats, musicContext.tempo),
           beatsToSeconds(settings.continueBeats, musicContext.tempo),
           (text, progress) => update(`${prefix}${text}`, ((i + progress) / tracks.length) * 100),
           signal,
@@ -293,6 +328,7 @@ async function processSelection(
           settings,
           sourceWavPath,
           musicContext,
+          beatsToSeconds(selectionBeats, musicContext.tempo),
           (text, progress) => update(`${prefix}${text}`, ((i + progress) / tracks.length) * 100),
           signal,
         );
@@ -337,6 +373,33 @@ async function processSelection(
   await writeStoredSettings(context, settingsForStorage(initialSettings, settings, operation));
 }
 
+async function handleCommandError(
+  context: Context,
+  operation: SelectionOperation,
+  error: unknown,
+) {
+  if (isAbortError(error)) {
+    console.log(`[gary-sa3] ${operation} cancelled`);
+    return;
+  }
+
+  console.error(`[gary-sa3] ${operation} failed`, error);
+  try {
+    await showErrorDialog(context, `SA3 ${capitalize(operation)} Failed`, error);
+  } catch (dialogError) {
+    console.error("[gary-sa3] failed to show error dialog", dialogError);
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const record = error as { name?: unknown; code?: unknown };
+  return record.name === "AbortError" || record.code === "ABORT_ERR";
+}
+
 async function runTransformDialog(
   context: Context,
   initial: {
@@ -362,7 +425,7 @@ async function runTransformDialog(
       beatsPerBar: initial.musicContext.beatsPerBar,
       tempoLabel: `${Math.round(initial.musicContext.tempo)} bpm`,
       keyScaleLabel: initial.musicContext.keyScale || "scale off",
-      localBackendUrl: DEFAULT_LOCAL_SA3_URL,
+      embeddedModelStatus: embeddedModelStatus(embeddedOptionsFromSettings(settings)),
       availableLoras: mergeLoraNames(loraNames, settings.loras.map((lora) => lora.name)),
       statusMessage,
     });
@@ -377,7 +440,7 @@ async function runTransformDialog(
     }
 
     if (result.settings) {
-      settings = sanitizeSettings(result.settings);
+      settings = settingsWithEmbeddedDefaults(context, sanitizeSettings(result.settings));
       await writeStoredSettings(
         context,
         settingsForStorage(initial.settings, settings, initial.operation),
@@ -385,7 +448,7 @@ async function runTransformDialog(
     }
 
     if (result.action === "refresh-loras") {
-      loraNames = await fetchAvailableLoras(settings.backendUrl);
+      loraNames = await fetchAvailableLoras(embeddedOptionsFromSettings(settings));
       statusMessage = loraStatusMessage(loraNames);
       await writeStoredSettings(
         context,
@@ -397,8 +460,8 @@ async function runTransformDialog(
     if (result.action === "dice") {
       try {
         const dice = await fetchDicePrompt(
-          settings.backendUrl,
           settings.loras.map((lora) => lora.name),
+          embeddedOptionsFromSettings(settings),
         );
         settings = {
           ...settings,
@@ -437,7 +500,7 @@ async function showTransformDialog(
   });
 
   try {
-    const result = await context.ui.showModalDialog(server.url, 620, 500);
+    const result = await context.ui.showModalDialog(server.url, 680, 560);
     const dialogResult = JSON.parse(result) as DialogResult;
     if (dialogResult.settings) {
       storedSettings = settingsForStorage(storedSettings, sanitizeSettings(dialogResult.settings), initial.operation);
@@ -449,57 +512,114 @@ async function showTransformDialog(
   }
 }
 
+async function showErrorDialog(context: Context, title: string, error: unknown) {
+  const message = errorToMessage(error);
+  const details = errorToDetails(error);
+  const html = errorDialogHtml(title, message, details);
+  const server = await startDialogServer(html);
+
+  try {
+    await context.ui.showModalDialog(server.url, 520, details ? 300 : 210);
+  } finally {
+    await server.close();
+  }
+}
+
+function errorDialogHtml(title: string, message: string, details: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)}</title>
+  <script>
+    function closeDialog() {
+      const message = { method: "close_and_send", params: ["ok"] };
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.live) {
+        window.webkit.messageHandlers.live.postMessage(message);
+      } else if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.postMessage(message);
+      }
+    }
+    document.addEventListener("DOMContentLoaded", () => {
+      document.getElementById("ok").addEventListener("click", closeDialog);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" || event.key === "Enter") closeDialog();
+      });
+      document.getElementById("ok").focus();
+    });
+  </script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      background: #363636;
+      color: #d0d0d0;
+      font-family: "AbletonSansSmall", Arial, sans-serif;
+      font-size: 11.5px;
+    }
+    .shell { display: grid; gap: 12px; }
+    h1 { margin: 0; font-size: 13px; }
+    p { margin: 0; line-height: 1.4; color: #f0b1a6; overflow-wrap: anywhere; }
+    pre {
+      max-height: 118px;
+      margin: 0;
+      padding: 8px;
+      overflow: auto;
+      white-space: pre-wrap;
+      background: #202020;
+      color: #bdbdbd;
+      border: 1px solid #111;
+    }
+    .buttons { display: flex; justify-content: flex-end; }
+    button {
+      height: 24px;
+      min-width: 62px;
+      border: 1px solid #111;
+      background: #ffb15f;
+      color: #151515;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(message)}</p>
+    ${details ? `<pre>${escapeHtml(details)}</pre>` : ""}
+    <div class="buttons"><button id="ok" type="button">OK</button></div>
+  </div>
+</body>
+</html>`;
+}
+
 async function submitAndDownloadTransform(
   context: Context,
   settings: TransformSettings,
   sourceWavPath: string,
   musicContext: MusicContext,
+  durationSeconds: number,
   update: (text: string, progress: number) => Promise<void>,
   signal: AbortSignal,
 ): Promise<TransformResult> {
-  const sourceBytes = await fs.readFile(sourceWavPath);
-  const audioData = sourceBytes.toString("base64");
   const prompt = composePrompt(settings.prompt, musicContext);
-  const baseUrl = normalizeBaseUrl(settings.backendUrl);
-
-  const submitResponse = await fetchJson(`${baseUrl}/transform`, {
-    prompt,
-    audio_data: audioData,
-    strength: settings.strength,
-    steps: settings.steps,
-    cfg_scale: settings.cfgScale,
-    shift: settings.shift,
-    seed: settings.useSeed ? settings.seed : -1,
-    loras: settings.loras.map((lora) => ({
-      name: lora.name,
-      strength: lora.strength,
-      interval_min: 0.0,
-      interval_max: 1.0,
-    })),
-    ...(settings.negativePrompt ? { negative_prompt: settings.negativePrompt } : {}),
-  }, signal);
-
-  if (!submitResponse.success || typeof submitResponse.session_id !== "string") {
-    throw new Error(errorFromResponse(submitResponse, "SA3 transform submit failed"));
+  console.log("[gary-sa3] embedded SA3 transform selected");
+  const outputPath = await outputWavPath(context, "transform", path.dirname(sourceWavPath));
+  const transformed = await runEmbeddedSa3(
+    embeddedSa3Request(settings, prompt, durationSeconds, {
+      operation: "transform",
+      initPath: sourceWavPath,
+      initNoiseLevel: settings.strength,
+    }),
+    outputPath,
+    update,
+    signal,
+  );
+  if (transformed.seed) {
+    console.log(`[gary-sa3] embedded transform seed ${transformed.seed}`);
   }
-
-  const status = await pollForCompletion(baseUrl, submitResponse.session_id, update, signal, "SA3 transform");
-  if (!status.audio_data) {
-    throw new Error("SA3 completed without audio_data.");
-  }
-
-  const tempDirectory = context.environment.tempDirectory ?? path.dirname(sourceWavPath);
-  const outputPath = path.join(tempDirectory, `gary-sa3-transform-${randomUUID()}.wav`);
-  await fs.writeFile(outputPath, Buffer.from(status.audio_data, "base64"));
-
-  const seed = status.meta?.seed;
-  if (seed !== undefined) {
-    console.log(`[gary-sa3] transform seed ${seed}`);
-  }
-
-  return seed === undefined
-    ? { filePath: outputPath }
-    : { filePath: outputPath, seed: String(seed) };
+  return transformed;
 }
 
 async function submitAndDownloadGenerate(
@@ -515,49 +635,20 @@ async function submitAndDownloadGenerate(
   }
 
   const prompt = composePrompt(settings.prompt, musicContext);
-  const baseUrl = normalizeBaseUrl(settings.backendUrl);
-
-  const submitResponse = await fetchJson(`${baseUrl}/generate`, {
-    prompt,
-    duration: Number(durationSeconds.toFixed(3)),
-    steps: settings.steps,
-    cfg_scale: settings.cfgScale,
-    shift: settings.shift,
-    seed: settings.useSeed ? settings.seed : -1,
-    loras: settings.loras.map((lora) => ({
-      name: lora.name,
-      strength: lora.strength,
-      interval_min: 0.0,
-      interval_max: 1.0,
-    })),
-    ...(settings.negativePrompt ? { negative_prompt: settings.negativePrompt } : {}),
-  }, signal);
-
-  if (!submitResponse.success || typeof submitResponse.session_id !== "string") {
-    throw new Error(errorFromResponse(submitResponse, "SA3 generate submit failed"));
+  console.log(
+    `[gary-sa3] embedded SA3 generate selected duration=${durationSeconds.toFixed(3)} steps=${settings.steps} loras=${settings.loras.length}`,
+  );
+  const outputPath = await outputWavPath(context, "generate");
+  const generated = await runEmbeddedSa3(
+    embeddedSa3Request(settings, prompt, durationSeconds, { operation: "generate" }),
+    outputPath,
+    update,
+    signal,
+  );
+  if (generated.seed) {
+    console.log(`[gary-sa3] embedded generate seed ${generated.seed}`);
   }
-
-  const status = await pollForCompletion(baseUrl, submitResponse.session_id, update, signal, "SA3 generate");
-  if (!status.audio_data) {
-    throw new Error("SA3 completed without audio_data.");
-  }
-
-  const tempDirectory = context.environment.tempDirectory;
-  if (!tempDirectory) {
-    throw new Error("Extension temp directory is unavailable.");
-  }
-
-  const outputPath = path.join(tempDirectory, `gary-sa3-generate-${randomUUID()}.wav`);
-  await fs.writeFile(outputPath, Buffer.from(status.audio_data, "base64"));
-
-  const seed = status.meta?.seed;
-  if (seed !== undefined) {
-    console.log(`[gary-sa3] generate seed ${seed}`);
-  }
-
-  return seed === undefined
-    ? { filePath: outputPath }
-    : { filePath: outputPath, seed: String(seed) };
+  return generated;
 }
 
 async function submitAndDownloadContinue(
@@ -565,6 +656,7 @@ async function submitAndDownloadContinue(
   settings: TransformSettings,
   sourceWavPath: string,
   musicContext: MusicContext,
+  sourceDurationSeconds: number,
   continuationSeconds: number,
   update: (text: string, progress: number) => Promise<void>,
   signal: AbortSignal,
@@ -573,118 +665,93 @@ async function submitAndDownloadContinue(
     throw new Error("SA3 continue needs a positive continuation length.");
   }
 
-  const sourceBytes = await fs.readFile(sourceWavPath);
-  const audioData = sourceBytes.toString("base64");
   const prompt = composePrompt(settings.prompt, musicContext);
-  const baseUrl = normalizeBaseUrl(settings.backendUrl);
+  const totalDurationSeconds = sourceDurationSeconds + continuationSeconds;
+  console.log(
+    `[gary-sa3] embedded SA3 continue selected source=${sourceDurationSeconds.toFixed(3)}s add=${continuationSeconds.toFixed(3)}s total=${totalDurationSeconds.toFixed(3)}s`,
+  );
+  const outputPath = await outputWavPath(context, "continue", path.dirname(sourceWavPath));
+  const continued = await runEmbeddedSa3(
+    embeddedSa3Request(settings, prompt, continuationSeconds, {
+      operation: "continue",
+      initPath: sourceWavPath,
+    }),
+    outputPath,
+    update,
+    signal,
+  );
+  if (continued.seed) {
+    console.log(`[gary-sa3] embedded continue seed ${continued.seed}`);
+  }
+  return continued;
+}
 
-  const submitResponse = await fetchJson(`${baseUrl}/continue`, {
+function embeddedSa3Request(
+  settings: TransformSettings,
+  prompt: string,
+  durationSeconds: number,
+  overrides: Partial<EmbeddedSa3Request> & Pick<EmbeddedSa3Request, "operation">,
+): EmbeddedSa3Request {
+  return {
+    operation: overrides.operation,
+    ...embeddedOptionsFromSettings(settings),
+    device: settings.embeddedDevice,
     prompt,
-    audio_data: audioData,
-    continuation_seconds: Number(continuationSeconds.toFixed(3)),
-    continuation_mode: "inpaint",
+    negativePrompt: settings.negativePrompt,
+    durationSeconds,
+    generationTailPaddingSeconds: settings.generationEndingMode === "ends-here" ? 0 : SA3_CPP_TAIL_PAD_SECONDS,
+    continuationTailPaddingSeconds: settings.continuationEndingMode === "ends-here" ? 0 : SA3_CPP_TAIL_PAD_SECONDS,
+    decoderLoraEnabled: settings.decoderLoraEnabled,
+    peakNormalize: settings.peakNormalize,
+    peakNormalizeDb: settings.peakNormalizeDb,
+    limiter: settings.limiter,
+    limiterCeilingDb: settings.limiterCeilingDb,
+    limiterKnee: settings.limiterKnee,
     steps: settings.steps,
-    cfg_scale: settings.cfgScale,
-    shift: settings.shift,
+    cfgScale: settings.cfgScale,
+    distShift: sa3CppDistShift(settings.shift),
     seed: settings.useSeed ? settings.seed : -1,
+    keepModels: settings.keepModelsResident,
     loras: settings.loras.map((lora) => ({
       name: lora.name,
       strength: lora.strength,
-      interval_min: 0.0,
-      interval_max: 1.0,
     })),
-    ...(settings.negativePrompt ? { negative_prompt: settings.negativePrompt } : {}),
-  }, signal);
-
-  if (!submitResponse.success || typeof submitResponse.session_id !== "string") {
-    throw new Error(errorFromResponse(submitResponse, "SA3 continue submit failed"));
-  }
-
-  const status = await pollForCompletion(baseUrl, submitResponse.session_id, update, signal, "SA3 continue");
-  if (!status.audio_data) {
-    throw new Error("SA3 completed without audio_data.");
-  }
-
-  const tempDirectory = context.environment.tempDirectory ?? path.dirname(sourceWavPath);
-  const outputPath = path.join(tempDirectory, `gary-sa3-continue-${randomUUID()}.wav`);
-  await fs.writeFile(outputPath, Buffer.from(status.audio_data, "base64"));
-
-  const seed = status.meta?.seed;
-  if (seed !== undefined) {
-    console.log(`[gary-sa3] continue seed ${seed}`);
-  }
-
-  return seed === undefined
-    ? { filePath: outputPath }
-    : { filePath: outputPath, seed: String(seed) };
-}
-
-async function pollForCompletion(
-  baseUrl: string,
-  sessionId: string,
-  update: (text: string, progress: number) => Promise<void>,
-  signal: AbortSignal,
-  operationLabel: string,
-): Promise<PollStatus> {
-  const startedAt = Date.now();
-  const timeoutMs = 20 * 60 * 1000;
-
-  while (Date.now() - startedAt < timeoutMs) {
-    signal.throwIfAborted();
-    await delay(1500, signal);
-
-    const status = await fetchJson<PollStatus>(
-      `${baseUrl}/poll_status/${encodeURIComponent(sessionId)}`,
-      undefined,
-      signal,
-    );
-
-    if (status.status === "completed") {
-      await update("SA3 completed", 0.85);
-      return status;
-    }
-
-    if (status.status === "failed" || status.success === false) {
-      throw new Error(errorFromResponse(status, `${operationLabel} failed`));
-    }
-
-    const progress = typeof status.progress === "number"
-      ? Math.max(0.2, Math.min(0.85, status.progress / 100))
-      : 0.35;
-    await update(status.status ? `SA3 ${status.status}` : "SA3 working", progress);
-  }
-
-  throw new Error(`${operationLabel} timed out.`);
-}
-
-async function fetchJson<T = Record<string, unknown>>(
-  url: string,
-  body: Record<string, unknown> | undefined,
-  signal: AbortSignal,
-): Promise<T> {
-  const init: RequestInit = {
-    method: body ? "POST" : "GET",
-    signal,
+    initPath: overrides.initPath,
+    initNoiseLevel: overrides.initNoiseLevel,
+    encodeChunkSize: 128,
+    encodeOverlap: 32,
+    decodeChunkSize: 128,
+    decodeOverlap: 32,
   };
+}
 
-  if (body) {
-    init.headers = { "Content-Type": "application/json" };
-    init.body = JSON.stringify(body);
+function sa3CppDistShift(shift: string): string {
+  switch (shift.toLowerCase()) {
+    case "none":
+      return "None";
+    case "flux":
+      return "Flux";
+    case "full":
+      return "Full";
+    case "default":
+    case "logsnr":
+    default:
+      return "LogSNR";
   }
+}
 
-  const response = await fetch(url, init);
+async function outputWavPath(
+  context: Context,
+  operation: SelectionOperation,
+  fallbackDirectory?: string,
+): Promise<string> {
+  const tempDirectory =
+    context.environment.tempDirectory ??
+    fallbackDirectory ??
+    path.join(os.tmpdir(), "gary-sa3-ableton");
+  await fs.mkdir(tempDirectory, { recursive: true });
 
-  const text = await response.text();
-  let json: unknown = {};
-  if (text.trim()) {
-    json = JSON.parse(text);
-  }
-
-  if (!response.ok) {
-    throw new Error(errorFromResponse(json, `HTTP ${response.status}`));
-  }
-
-  return json as T;
+  return path.join(tempDirectory, `gary-sa3-${operation}-${randomUUID()}.wav`);
 }
 
 async function startDialogServer(
@@ -695,9 +762,10 @@ async function startDialogServer(
 ): Promise<{ url: string; close: () => Promise<void> }> {
   const server = http.createServer((request, response) => {
     void handleDialogRequest(html, options, request, response).catch((error) => {
+      console.error(`[gary-sa3] dialog bridge failed ${request.method || ""} ${request.url || ""}`, error);
       sendJson(response, 500, {
         success: false,
-        error: error instanceof Error ? error.message : "dialog bridge failed",
+        error: errorToMessage(error),
       });
     });
   });
@@ -751,6 +819,49 @@ async function handleDialogRequest(
     return;
   }
 
+  if (route.path === "/api/embedded/models/download" && request.method === "POST") {
+    const payload = asRecord(await readJsonBody(request));
+    const status = await startEmbeddedModelDownload(embeddedOptionsFromRecord(payload));
+    sendJson(response, 200, { success: true, ...status });
+    return;
+  }
+
+  if (route.path === "/api/embedded/models/cancel" && request.method === "POST") {
+    const status = cancelEmbeddedModelDownload();
+    sendJson(response, 200, { success: true, ...status });
+    return;
+  }
+
+  if (route.path === "/api/embedded/decoder/download" && request.method === "POST") {
+    const payload = asRecord(await readJsonBody(request));
+    const status = await startEmbeddedDecoderLoraDownload(embeddedOptionsFromRecord(payload));
+    sendJson(response, 200, { success: true, ...status });
+    return;
+  }
+
+  if (route.path === "/api/embedded/decoder/cancel" && request.method === "POST") {
+    const payload = asRecord(await readJsonBody(request));
+    const status = cancelEmbeddedDecoderLoraDownload(embeddedOptionsFromRecord(payload));
+    sendJson(response, 200, { success: true, ...status });
+    return;
+  }
+
+  if (route.path === "/api/embedded/models/reveal" && request.method === "POST") {
+    const payload = asRecord(await readJsonBody(request));
+    const directory = embeddedEffectiveDirs(embeddedOptionsFromRecord(payload)).modelsDir;
+    await revealDirectory(directory);
+    sendJson(response, 200, { success: true, path: directory });
+    return;
+  }
+
+  if (route.path === "/api/embedded/loras/reveal" && request.method === "POST") {
+    const payload = asRecord(await readJsonBody(request));
+    const directory = embeddedEffectiveDirs(embeddedOptionsFromRecord(payload)).lorasVariantDir;
+    await revealDirectory(directory);
+    sendJson(response, 200, { success: true, path: directory });
+    return;
+  }
+
   if (request.method !== "GET") {
     sendJson(response, 405, { success: false, error: "method not allowed" });
     return;
@@ -766,18 +877,16 @@ async function handleDialogRequest(
   }
 
   if (route.path === "/api/prompts") {
-    const backendUrl = route.query.backendUrl || DEFAULT_LOCAL_SA3_URL;
     const loras = route.query.lora
       ? route.query.lora.split(",").map((name) => name.trim()).filter(Boolean)
       : [];
-    const dice = await fetchDicePrompt(backendUrl, loras);
+    const dice = await fetchDicePrompt(loras, embeddedOptionsFromRecord(route.query));
     sendJson(response, 200, { success: true, ...dice });
     return;
   }
 
   if (route.path === "/api/loras") {
-    const backendUrl = route.query.backendUrl || DEFAULT_LOCAL_SA3_URL;
-    const loras = await fetchAvailableLoras(backendUrl);
+    const loras = await fetchAvailableLoras(embeddedOptionsFromRecord(route.query));
     sendJson(response, 200, {
       success: true,
       loras,
@@ -787,9 +896,29 @@ async function handleDialogRequest(
   }
 
   if (route.path === "/api/health") {
-    const backendUrl = route.query.backendUrl || DEFAULT_LOCAL_SA3_URL;
-    const health = await checkBackendHealth(backendUrl);
+    const health = embeddedSa3Diagnostics(embeddedOptionsFromRecord(route.query));
     sendJson(response, 200, { success: true, ...health });
+    return;
+  }
+
+  if (route.path === "/api/embedded/models/status") {
+    const options = embeddedOptionsFromRecord(route.query);
+    sendJson(response, 200, {
+      success: true,
+      ...embeddedModelStatus(options),
+      download: embeddedDownloadStatus(options),
+      variants: availableEmbeddedVariants(options),
+      dirs: embeddedEffectiveDirs(options),
+    });
+    return;
+  }
+
+  if (route.path === "/api/embedded/decoder/status") {
+    const options = embeddedOptionsFromRecord(route.query);
+    sendJson(response, 200, {
+      success: true,
+      ...embeddedDecoderLoraStatus(options),
+    });
     return;
   }
 
@@ -814,59 +943,56 @@ async function readJsonBody(request: http.IncomingMessage): Promise<unknown> {
   return text ? JSON.parse(text) : {};
 }
 
-async function fetchJsonWithTimeout<T = unknown>(url: string, timeoutMs: number): Promise<T> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new Error("request timed out")), timeoutMs);
-
-  try {
-    return await fetchJson<T>(url, undefined, controller.signal);
-  } finally {
-    clearTimeout(timeout);
+async function revealDirectory(directory: string): Promise<void> {
+  if (!directory) {
+    throw new Error("no directory to reveal");
   }
+
+  await fs.mkdir(directory, { recursive: true });
+  const opener = process.platform === "win32"
+    ? "explorer.exe"
+    : process.platform === "darwin"
+      ? "open"
+      : "xdg-open";
+  // explorer.exe reports a nonzero exit code even on success, so fire and forget.
+  execFile(opener, [directory], () => {});
 }
 
-async function checkBackendHealth(backendUrl: string): Promise<BackendHealth> {
-  try {
-    const response = await fetchJsonWithTimeout<unknown>(`${normalizeBaseUrl(backendUrl)}/health`, 2500);
-    if (healthResponseLooksOnline(response)) {
-      return { online: true, status: healthStatusLabel(response) };
-    }
-
-    return { online: false, status: healthStatusLabel(response) };
-  } catch (error) {
-    console.warn("[gary-sa3] health check failed", error);
-    return { online: false, status: "offline" };
-  }
-}
-
-async function fetchAvailableLoras(backendUrl: string): Promise<string[]> {
-  try {
-    const response = await fetchJsonWithTimeout<unknown>(`${normalizeBaseUrl(backendUrl)}/loras`, 8000);
-    return parseLoraNames(response);
-  } catch (error) {
-    console.warn("[gary-sa3] lora fetch failed", error);
-    return [];
-  }
+async function fetchAvailableLoras(embeddedOptions: EmbeddedModelOptions = {}): Promise<string[]> {
+  return listEmbeddedLoras(embeddedOptions);
 }
 
 async function fetchDicePrompt(
-  backendUrl: string,
   activeLoraNames: string[],
+  embeddedOptions: EmbeddedModelOptions = {},
 ): Promise<DicePromptResult> {
-  const baseUrl = normalizeBaseUrl(backendUrl);
-  const loraQuery = uniqueStrings(activeLoraNames.map((name) => name.trim()).filter(Boolean));
-  const url = appendQuery(`${baseUrl}/prompts`, loraQuery.length > 0
-    ? { lora: loraQuery.join(",") }
-    : {});
-
-  const response = await fetchJsonWithTimeout<unknown>(url, 15000);
-  return pickDicePrompt(response);
+  const dice = await embeddedDicePrompts(activeLoraNames, embeddedOptions);
+  return pickDicePrompt({
+    success: true,
+    prompts: dice.prompts,
+    missing_loras: dice.missingLoras,
+  });
 }
 
 function sanitizeSettings(settings: TransformSettings): TransformSettings {
   const seed = Number.isFinite(Number(settings.seed)) ? Math.trunc(Number(settings.seed)) : -1;
   return {
-    backendUrl: normalizeBaseUrl(settings.backendUrl || DEFAULT_LOCAL_SA3_URL),
+    embeddedModelsDir: typeof settings.embeddedModelsDir === "string" ? settings.embeddedModelsDir.trim() : "",
+    embeddedLorasDir: typeof settings.embeddedLorasDir === "string" ? settings.embeddedLorasDir.trim() : "",
+    embeddedVariant: ["medium", "small-music", "small-sfx"].includes(settings.embeddedVariant)
+      ? settings.embeddedVariant
+      : "medium",
+    embeddedEncoding: String(settings.embeddedEncoding || "").trim().toLowerCase() === "f32" ? "f32" : "f16",
+    embeddedDevice: String(settings.embeddedDevice || "").trim().toLowerCase() === "cpu" ? "cpu" : "auto",
+    keepModelsResident: Boolean(settings.keepModelsResident),
+    decoderLoraEnabled: settings.decoderLoraEnabled !== false,
+    generationEndingMode: settings.generationEndingMode === "ends-here" ? "ends-here" : "keeps-going",
+    continuationEndingMode: settings.continuationEndingMode === "ends-here" ? "ends-here" : "keeps-going",
+    peakNormalize: settings.peakNormalize !== false,
+    peakNormalizeDb: clamp(Number(settings.peakNormalizeDb), -6, 6),
+    limiter: settings.limiter !== false,
+    limiterCeilingDb: clamp(Number(settings.limiterCeilingDb), -6, 0),
+    limiterKnee: clamp(Number(settings.limiterKnee), 0.1, 1),
     prompt: settings.prompt.trim(),
     strength: clamp(Number(settings.strength), 0.01, 1.0),
     steps: Math.round(clamp(Number(settings.steps), 4, 16)),
@@ -882,6 +1008,37 @@ function sanitizeSettings(settings: TransformSettings): TransformSettings {
     continueBeats: clamp(Number(settings.continueBeats), 0, 1024),
     loras: sanitizeLoras(settings.loras),
   };
+}
+
+function settingsWithEmbeddedDefaults(context: Context, settings: TransformSettings): TransformSettings {
+  return sanitizeSettings({
+    ...settings,
+    embeddedModelsDir: settings.embeddedModelsDir || defaultEmbeddedModelsDir(context.environment.storageDirectory),
+    embeddedLorasDir: settings.embeddedLorasDir || defaultEmbeddedLorasDir(context.environment.storageDirectory),
+  });
+}
+
+function embeddedOptionsFromSettings(settings: TransformSettings): EmbeddedModelOptions {
+  return {
+    modelsDir: settings.embeddedModelsDir,
+    adaptersDir: settings.embeddedLorasDir,
+    variant: settings.embeddedVariant,
+    encoding: settings.embeddedEncoding,
+  };
+}
+
+function embeddedOptionsFromRecord(record: Record<string, unknown> | undefined): EmbeddedModelOptions {
+  return {
+    modelsDir: stringField(record, "modelsDir") || stringField(record, "embeddedModelsDir"),
+    adaptersDir: stringField(record, "adaptersDir") || stringField(record, "embeddedLorasDir"),
+    variant: stringField(record, "variant") || stringField(record, "embeddedVariant"),
+    encoding: stringField(record, "encoding") || stringField(record, "embeddedEncoding"),
+  };
+}
+
+function stringField(record: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" ? value.trim() : undefined;
 }
 
 function settingsForStorage(
@@ -921,45 +1078,6 @@ function sanitizeLoras(loras: LoraSelection[] | undefined): LoraSelection[] {
   }
 
   return sanitized;
-}
-
-function parseLoraNames(response: unknown): string[] {
-  const record = asRecord(response);
-  const loras = Array.isArray(record?.loras) ? record.loras : [];
-  const names = loras
-    .map((item) => {
-      if (typeof item === "string") {
-        return item.trim();
-      }
-      return asRecord(item)?.name?.toString().trim() ?? "";
-    })
-    .filter(Boolean);
-
-  return uniqueStrings(names);
-}
-
-function healthResponseLooksOnline(response: unknown): boolean {
-  const record = asRecord(response);
-  if (!record) {
-    return response !== undefined && response !== null;
-  }
-
-  const status = String(record.status ?? "").trim().toLowerCase();
-  if (!status) {
-    return true;
-  }
-
-  return !["unhealthy", "failed", "down", "error", "offline"].includes(status);
-}
-
-function healthStatusLabel(response: unknown): string {
-  const record = asRecord(response);
-  if (!record) {
-    return "online";
-  }
-
-  const status = String(record.status ?? "").trim();
-  return status || "online";
 }
 
 function pickDicePrompt(response: unknown): DicePromptResult {
@@ -1107,22 +1225,6 @@ function formatBeatBarDuration(beats: number, beatsPerBar: number): string {
   return `${beats.toFixed(2)} beats / ${bars.toFixed(2)} ${barLabel}`;
 }
 
-function normalizeBaseUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "") || DEFAULT_LOCAL_SA3_URL;
-}
-
-function appendQuery(url: string, params: Record<string, string>): string {
-  const entries = Object.entries(params).filter(([, value]) => value.trim());
-  if (entries.length === 0) {
-    return url;
-  }
-
-  const query = entries
-    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
-    .join("&");
-  return `${url}${url.includes("?") ? "&" : "?"}${query}`;
-}
-
 function parseRequestUrl(rawUrl: string): { path: string; query: Record<string, string> } {
   const [pathPart = "/", queryPart = ""] = rawUrl.split("?", 2);
   const query: Record<string, string> = {};
@@ -1194,6 +1296,35 @@ function errorFromResponse(response: unknown, fallback: string): string {
   return fallback;
 }
 
+function errorToMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim();
+  }
+
+  return String(error || "Unknown error");
+}
+
+function errorToDetails(error: unknown): string {
+  if (error instanceof Error && error.stack) {
+    return error.stack;
+  }
+
+  return "";
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function capitalize(value: string): string {
+  return value ? value[0]!.toUpperCase() + value.slice(1) : value;
+}
+
 function makeClipName(prompt: string, trackName: string, operation: SelectionOperation): string {
   const base = prompt.trim() || trackName.trim() || "selection";
   const prefix = operation === "generate"
@@ -1234,14 +1365,4 @@ function clamp(value: number, min: number, max: number): number {
     return min;
   }
   return Math.max(min, Math.min(max, value));
-}
-
-function delay(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(resolve, ms);
-    signal.addEventListener("abort", () => {
-      clearTimeout(timeout);
-      reject(signal.reason ?? new Error("Aborted"));
-    }, { once: true });
-  });
 }

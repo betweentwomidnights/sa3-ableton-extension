@@ -46,6 +46,11 @@ struct GenerateOptions {
   float continuation_tail_padding_sec = 6.0f;
   bool keep_models = false;
   std::string dist_shift = "LogSNR";
+  bool peak_normalize = true;
+  float peak_normalize_db = 2.0f;
+  bool limiter = true;
+  float limiter_ceiling_db = -0.3f;
+  float limiter_knee = 0.8f;
 
   std::string init_path;
   float init_noise_level = 0.85f;
@@ -243,6 +248,11 @@ GenerateOptions parse_generate_options(napi_env env, napi_value value) {
     env, value, "continuationTailPaddingSeconds", options.continuation_tail_padding_sec);
   options.keep_models = get_bool(env, value, "keepModels", options.keep_models);
   options.dist_shift = get_string(env, value, "distShift", options.dist_shift);
+  options.peak_normalize = get_bool(env, value, "peakNormalize", options.peak_normalize);
+  options.peak_normalize_db = (float)get_double(env, value, "peakNormalizeDb", options.peak_normalize_db);
+  options.limiter = get_bool(env, value, "limiter", options.limiter);
+  options.limiter_ceiling_db = (float)get_double(env, value, "limiterCeilingDb", options.limiter_ceiling_db);
+  options.limiter_knee = (float)get_double(env, value, "limiterKnee", options.limiter_knee);
   options.init_path = get_string(env, value, "initPath", "");
   options.init_noise_level = (float)get_double(env, value, "initNoiseLevel", options.init_noise_level);
   options.encode_chunk_size = get_int(env, value, "encodeChunkSize", options.encode_chunk_size);
@@ -548,6 +558,13 @@ void execute_generate(napi_env, void* data) {
     request.continuation_tail_padding_seconds = work->options.continuation_tail_padding_sec;
     request.residency = work->options.keep_models ? SA3_RESIDENCY_RESIDENT_V1 : SA3_RESIDENCY_FRUGAL_V1;
     request.distribution_shift = distribution_shift(work->options.dist_shift);
+    request.loudness.peak_normalize = work->options.peak_normalize ? 1 : 0;
+    request.loudness.peak_normalize_db = work->options.peak_normalize_db;
+    request.loudness.limiter = work->options.limiter ? 1 : 0;
+    request.loudness.limiter_ceiling_db = work->options.limiter_ceiling_db;
+    request.loudness.limiter_knee = work->options.limiter_knee;
+    request.loudness.latent_rescale = 1.0f;
+    request.loudness.latent_shift = 0.0f;
     request.adapters = adapters.empty() ? nullptr : adapters.data();
     request.adapter_count = (uint32_t)adapters.size();
     request.encode_chunk_size = work->options.encode_chunk_size;

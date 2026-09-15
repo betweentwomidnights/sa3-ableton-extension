@@ -4,7 +4,6 @@ import * as path from "node:path";
 import { createRequire } from "node:module";
 import { promptDefaults } from "./prompt-defaults.js";
 
-export const EMBEDDED_SA3_URL = "embedded://sa3";
 const VARIANT_NAMES = ["medium", "small-music", "small-sfx"];
 
 export interface EmbeddedLora {
@@ -29,6 +28,12 @@ export interface EmbeddedSa3Request {
   keepModels: boolean;
   generationTailPaddingSeconds: number;
   continuationTailPaddingSeconds: number;
+  decoderLoraEnabled: boolean;
+  peakNormalize: boolean;
+  peakNormalizeDb: number;
+  limiter: boolean;
+  limiterCeilingDb: number;
+  limiterKnee: number;
   loras: EmbeddedLora[];
   initPath?: string | undefined;
   initNoiseLevel?: number | undefined;
@@ -83,6 +88,16 @@ export interface EmbeddedDownloadStatus extends EmbeddedModelStatus {
   label: string;
 }
 
+export interface EmbeddedDecoderLoraStatus {
+  compatible: boolean;
+  installed: boolean;
+  active: boolean;
+  done: boolean;
+  error: string;
+  progress: number;
+  label: string;
+}
+
 interface ModelDownloadItem {
   repo: string;
   filename: string;
@@ -107,17 +122,15 @@ export interface EmbeddedVariantAvailability {
 
 let downloadState: EmbeddedDownloadStatus | undefined;
 let downloadCancelRequested = false;
+let decoderDownloadState: EmbeddedDecoderLoraStatus | undefined;
+let decoderDownloadCancelRequested = false;
+
+const DECODER_LORA_REPO = "thepatch/same-l-decoder-lora";
+const DECODER_LORA_FILENAME = "squeakfix_v3.safetensors";
+const DECODER_LORA_GGUF_FILENAME = "squeakfix_v3-f32.gguf";
 
 let cachedNative: EmbeddedSa3Native | undefined;
 let cachedNativeError: string | undefined;
-
-export function isEmbeddedBackendUrl(url: string): boolean {
-  return normalizeEmbeddedUrl(url) === EMBEDDED_SA3_URL;
-}
-
-export function normalizeEmbeddedUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "").toLowerCase();
-}
 
 export function embeddedNativeDirectory(): string {
   return path.join(__dirname, "native", `${process.platform}-${process.arch}`);
@@ -245,12 +258,12 @@ async function readLoraFolder(directory: string, name: string): Promise<Embedded
     });
   for (const entry of safetensors) {
     const sidecar = `${entry.slice(0, -".safetensors".length)}.json`;
+    safetensorsPath = path.join(directory, entry);
     if (lowerEntries.has(sidecar.toLowerCase())) {
       const actualSidecar = entries.find((candidate) => candidate.toLowerCase() === sidecar.toLowerCase());
-      safetensorsPath = path.join(directory, entry);
       jsonPath = path.join(directory, actualSidecar ?? sidecar);
-      break;
     }
+    break;
   }
 
   if (!preferredGguf && !safetensorsPath) {
@@ -433,13 +446,13 @@ export async function resolveLorasForGeneration(
       continue;
     }
 
-    if (info.directory && info.safetensorsPath && info.jsonPath) {
+    if (info.directory && info.safetensorsPath) {
       await update?.(`converting lora ${info.name}`);
       const outputPath = path.join(info.directory, `${info.name}-f32.gguf`);
       const native = loadEmbeddedSa3();
       const converted = await native.convertLora({
         safetensorsPath: info.safetensorsPath,
-        jsonPath: info.jsonPath,
+        ...(info.jsonPath ? { jsonPath: info.jsonPath } : {}),
         outputPath,
       });
       resolved.push({ name: converted.outputPath || outputPath, strength: lora.strength });
@@ -510,6 +523,10 @@ export async function runEmbeddedSa3(
     { ...request, modelsDir },
     async (text) => update(text, 0.2),
   );
+  const decoder = embeddedDecoderLoraStatus(request);
+  if (request.decoderLoraEnabled && decoder.compatible && decoder.installed) {
+    loras.push({ name: decoderLoraPaths(request).ggufPath, strength: 1 });
+  }
 
   await update("loading embedded SA3", 0.22);
   const result = await native.generate(
@@ -531,6 +548,11 @@ export async function runEmbeddedSa3(
       keepModels: request.keepModels,
       generationTailPaddingSeconds: request.generationTailPaddingSeconds,
       continuationTailPaddingSeconds: request.continuationTailPaddingSeconds,
+      peakNormalize: request.peakNormalize,
+      peakNormalizeDb: request.peakNormalizeDb,
+      limiter: request.limiter,
+      limiterCeilingDb: request.limiterCeilingDb,
+      limiterKnee: request.limiterKnee,
       loras,
       initPath: request.initPath,
       initNoiseLevel: request.initNoiseLevel,
@@ -622,6 +644,65 @@ export function cancelEmbeddedModelDownload(): EmbeddedDownloadStatus {
     downloadState.label = "cancelling download";
   }
   return embeddedDownloadStatus();
+}
+
+export function embeddedDecoderLoraStatus(options: EmbeddedModelOptions = {}): EmbeddedDecoderLoraStatus {
+  const compatible = normalizeVariant(options.variant) === "medium";
+  const installed = fsSync.existsSync(decoderLoraPaths(options).ggufPath);
+  if (decoderDownloadState?.active) {
+    return { ...decoderDownloadState, compatible, installed };
+  }
+  return {
+    compatible,
+    installed,
+    active: false,
+    done: installed,
+    error: decoderDownloadState?.error || "",
+    progress: installed ? 1 : decoderDownloadState?.progress || 0,
+    label: installed ? "decoder correction ready" : decoderDownloadState?.label || "not installed",
+  };
+}
+
+export async function startEmbeddedDecoderLoraDownload(
+  options: EmbeddedModelOptions = {},
+): Promise<EmbeddedDecoderLoraStatus> {
+  if (decoderDownloadState?.active) {
+    return embeddedDecoderLoraStatus(options);
+  }
+
+  const paths = decoderLoraPaths(options);
+  await fs.mkdir(paths.directory, { recursive: true });
+  decoderDownloadCancelRequested = false;
+  decoderDownloadState = {
+    compatible: normalizeVariant(options.variant) === "medium",
+    installed: await fileExists(paths.ggufPath),
+    active: true,
+    done: false,
+    error: "",
+    progress: 0,
+    label: "starting decoder download",
+  };
+
+  void downloadDecoderLora(options).catch((error) => {
+    decoderDownloadState = {
+      ...embeddedDecoderLoraStatus(options),
+      active: false,
+      done: false,
+      error: error instanceof Error ? error.message : String(error),
+      label: "decoder download failed",
+    };
+  });
+  return embeddedDecoderLoraStatus(options);
+}
+
+export function cancelEmbeddedDecoderLoraDownload(
+  options: EmbeddedModelOptions = {},
+): EmbeddedDecoderLoraStatus {
+  decoderDownloadCancelRequested = true;
+  if (decoderDownloadState) {
+    decoderDownloadState.label = "cancelling decoder download";
+  }
+  return embeddedDecoderLoraStatus(options);
 }
 
 export function defaultEmbeddedModelsDir(storageDirectory?: string): string {
@@ -791,7 +872,7 @@ async function downloadModelSet(modelsDir: string, variant: string, encoding: st
         (completed + fileProgress) / plan.length,
         `downloading ${item.what} ${completed + 1}/${plan.length}`,
       );
-    });
+    }, () => downloadCancelRequested);
     completed += 1;
   }
 
@@ -824,7 +905,74 @@ function updateDownloadState(
   };
 }
 
-async function downloadFile(url: string, outputPath: string, onProgress: (progress: number) => void): Promise<void> {
+async function downloadDecoderLora(options: EmbeddedModelOptions): Promise<void> {
+  const paths = decoderLoraPaths(options);
+  if (!(await fileExists(paths.ggufPath))) {
+    if (!(await fileExists(paths.safetensorsPath))) {
+      const url = `https://huggingface.co/${DECODER_LORA_REPO}/resolve/main/${encodeURIComponent(DECODER_LORA_FILENAME)}`;
+      await downloadFile(url, paths.safetensorsPath, (progress) => {
+        decoderDownloadState = {
+          ...embeddedDecoderLoraStatus(options),
+          active: true,
+          done: false,
+          error: "",
+          progress: progress * 0.9,
+          label: "downloading decoder correction",
+        };
+      }, () => decoderDownloadCancelRequested);
+    }
+
+    if (decoderDownloadCancelRequested) {
+      throw new Error("download cancelled");
+    }
+    decoderDownloadState = {
+      ...embeddedDecoderLoraStatus(options),
+      active: true,
+      done: false,
+      error: "",
+      progress: 0.95,
+      label: "converting decoder correction",
+    };
+    const converted = await loadEmbeddedSa3().convertLora({
+      safetensorsPath: paths.safetensorsPath,
+      outputPath: paths.ggufPath,
+    });
+    if (!converted.outputPath && !(await fileExists(paths.ggufPath))) {
+      throw new Error("decoder conversion completed without an output file");
+    }
+  }
+
+  decoderDownloadState = {
+    compatible: normalizeVariant(options.variant) === "medium",
+    installed: true,
+    active: false,
+    done: true,
+    error: "",
+    progress: 1,
+    label: "decoder correction ready",
+  };
+}
+
+function decoderLoraPaths(options: EmbeddedModelOptions): {
+  directory: string;
+  safetensorsPath: string;
+  ggufPath: string;
+} {
+  const lorasDir = embeddedEffectiveDirs(options).lorasDir || defaultEmbeddedLorasDir();
+  const directory = path.join(lorasDir, "decoder", "squeakfix_v3");
+  return {
+    directory,
+    safetensorsPath: path.join(directory, DECODER_LORA_FILENAME),
+    ggufPath: path.join(directory, DECODER_LORA_GGUF_FILENAME),
+  };
+}
+
+async function downloadFile(
+  url: string,
+  outputPath: string,
+  onProgress: (progress: number) => void,
+  shouldCancel: () => boolean,
+): Promise<void> {
   const tempPath = `${outputPath}.part`;
   const response = await fetch(url);
   if (!response.ok || !response.body) {
@@ -839,7 +987,7 @@ async function downloadFile(url: string, outputPath: string, onProgress: (progre
 
   try {
     while (true) {
-      if (downloadCancelRequested) {
+      if (shouldCancel()) {
         throw new Error("download cancelled");
       }
       const { done, value } = await reader.read();

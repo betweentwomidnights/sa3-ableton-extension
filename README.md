@@ -8,13 +8,13 @@ stable audio 3 generation, transformation, and continuation directly inside Able
 >
 > **downloads (v0.1.0, experimental):** [cuda ~575 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-cuda.ablx) · [vulkan ~15 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-vulkan.ablx) · [cpu ~1 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-cpu.ablx) · [mac ~15 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0-metal/gary-extension-metal.ablx)
 >
-> everything should theoretically still work if you switch to http requests and `local` mode, but right now we're busy testing the different sa3.cpp builds (CUDA, VULKAN, and — very shortly — Metal) to see what breaks.
+> this branch now uses the embedded C ABI runtime exclusively. there is no backend URL or separate server mode.
 >
 > install with Developer Mode **off** in Ableton Live beta.
 
 ## embedded sa3.cpp backend (this branch)
 
-this branch embeds `sa3.cpp` directly inside the extension as a native node addon — no separate backend process. select `embedded` in the dialog's backend toggle.
+this branch embeds `sa3.cpp` directly inside the extension as a native node addon — no separate backend process or backend URL to configure.
 
 ### builds (cuda / vulkan / cpu)
 
@@ -102,12 +102,14 @@ runs the extension unsandboxed against a local Live install — set
 
 ### device toggle (auto / cpu)
 
-the dialog's embedded panel has a **device** dropdown:
+the dialog's **settings** view has a **device** dropdown:
 
 - `auto` — use the GPU if the build has one (cuda/vulkan), else CPU.
 - `cpu` — force the CPU backend, even on a GPU build (both the cuda and vulkan builds bundle `ggml-cpu.dll`, so this always works).
 
 switching device recreates the libsa3 context on the next generation. handy for A/B-ing GPU vs CPU, and CPU is genuinely usable for `small-music`.
+
+**keep models resident** is off by default. leave it off to release the model allocation after each job, or enable it for faster repeated generations when the extra GPU/CPU memory use is acceptable.
 
 under the hood this sets `sa3_context_config_v1.device`; the CLI's `SA3_DEVICE=cpu` / `SA3_GPU=<index-or-name>` env vars still work as the fallback when no explicit device is passed.
 
@@ -154,6 +156,16 @@ prefix a lora folder with `_` or `.` to disable it without deleting it.
 
 a future idea is a hugging face lora registry with a "download loras" button; for now, copy folders in by hand.
 
+### decoder correction
+
+the settings view can download and toggle the published `squeakfix_v3` decoder correction. it is applied at strength 1 only when the selected generation model is `medium` (SAME-L). the preference remains saved while a SAME-S model is selected, but the adapter is never passed to an incompatible small model.
+
+the advanced **ends here / keeps going** setting controls V1's tail padding for generate and continue. **ends here** uses zero seconds so the model plans an ending at the clip boundary; **keeps going** generates six seconds beyond the requested clip and trims the extra audio, so the requested boundary can remain in full motion.
+
+### output processing
+
+the settings view exposes the same post-decode loudness controls as the iPlug2 frontend: peak normalization with a -6 to +6 dB target, and a soft limiter with a -6 to 0 dB ceiling and 0.1 to 1.0 knee. **tuned defaults** restores normalize on at +2.0 dB and limiter on at -0.3 dB / 0.8 knee; **raw** disables both stages. latent rescale and latent shift intentionally remain at neutral values and are not exposed.
+
 ## ableton beta sequence
 
 ### easiest install
@@ -167,7 +179,7 @@ this is the path if you just want to use the extension:
 4. In Preferences -> Extensions, make sure Developer Mode is disabled.
 5. Install the `.ablx` extension from Live's extension UI.
 6. Restart Ableton Live beta if the menu entries do not appear.
-7. Make sure an SA3 backend is running at `http://localhost:8006`, or edit the backend URL in the extension dialog.
+7. Open a Generate, Transform, or Continue command; the bundled `sa3.cpp` runtime is checked automatically.
 
 ### developer mode
 

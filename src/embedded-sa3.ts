@@ -62,6 +62,7 @@ interface EmbeddedSa3Native {
     request: Record<string, unknown>,
     onProgress?: (stage: string, step: number, total: number, fraction: number) => void,
   ): Promise<EmbeddedSa3Result>;
+  cancelGeneration(): boolean;
   convertLora(request: Record<string, unknown>): Promise<{ outputPath: string }>;
 }
 
@@ -528,42 +529,60 @@ export async function runEmbeddedSa3(
     loras.push({ name: decoderLoraPaths(request).ggufPath, strength: 1 });
   }
 
-  await update("loading embedded SA3", 0.22);
-  const result = await native.generate(
-    {
-      modelsDir,
-      adaptersDir: resolveEmbeddedAdaptersDir(modelsDir, request.adaptersDir),
-      variant: normalizeVariant(request.variant),
-      encoding: normalizeEncoding(request.encoding),
-      device: normalizeDevice(request.device),
-      cpuThreads: numberFromEnv("SA3_THREADS", 0),
-      prompt: request.prompt,
-      negativePrompt: request.negativePrompt,
-      operation: request.operation,
-      duration: request.durationSeconds,
-      steps: request.steps,
-      cfgScale: request.cfgScale,
-      distShift: request.distShift,
-      seed: request.seed,
-      keepModels: request.keepModels,
-      generationTailPaddingSeconds: request.generationTailPaddingSeconds,
-      continuationTailPaddingSeconds: request.continuationTailPaddingSeconds,
-      peakNormalize: request.peakNormalize,
-      peakNormalizeDb: request.peakNormalizeDb,
-      limiter: request.limiter,
-      limiterCeilingDb: request.limiterCeilingDb,
-      limiterKnee: request.limiterKnee,
-      loras,
-      initPath: request.initPath,
-      initNoiseLevel: request.initNoiseLevel,
-      encodeChunkSize: request.encodeChunkSize,
-      encodeOverlap: request.encodeOverlap,
-      decodeChunkSize: request.decodeChunkSize,
-      decodeOverlap: request.decodeOverlap,
-    },
-    makeProgressReporter(update),
-  );
   signal.throwIfAborted();
+  await update("loading embedded SA3", 0.22);
+  const cancelGeneration = () => {
+    native.cancelGeneration();
+  };
+  signal.addEventListener("abort", cancelGeneration, { once: true });
+
+  let result: EmbeddedSa3Result;
+  try {
+    const generation = native.generate(
+      {
+        modelsDir,
+        adaptersDir: resolveEmbeddedAdaptersDir(modelsDir, request.adaptersDir),
+        variant: normalizeVariant(request.variant),
+        encoding: normalizeEncoding(request.encoding),
+        device: normalizeDevice(request.device),
+        cpuThreads: numberFromEnv("SA3_THREADS", 0),
+        prompt: request.prompt,
+        negativePrompt: request.negativePrompt,
+        operation: request.operation,
+        duration: request.durationSeconds,
+        steps: request.steps,
+        cfgScale: request.cfgScale,
+        distShift: request.distShift,
+        seed: request.seed,
+        keepModels: request.keepModels,
+        generationTailPaddingSeconds: request.generationTailPaddingSeconds,
+        continuationTailPaddingSeconds: request.continuationTailPaddingSeconds,
+        peakNormalize: request.peakNormalize,
+        peakNormalizeDb: request.peakNormalizeDb,
+        limiter: request.limiter,
+        limiterCeilingDb: request.limiterCeilingDb,
+        limiterKnee: request.limiterKnee,
+        loras,
+        initPath: request.initPath,
+        initNoiseLevel: request.initNoiseLevel,
+        encodeChunkSize: request.encodeChunkSize,
+        encodeOverlap: request.encodeOverlap,
+        decodeChunkSize: request.decodeChunkSize,
+        decodeOverlap: request.decodeOverlap,
+      },
+      makeProgressReporter(update),
+    );
+    if (signal.aborted) {
+      cancelGeneration();
+    }
+    result = await generation;
+    signal.throwIfAborted();
+  } catch (error) {
+    signal.throwIfAborted();
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", cancelGeneration);
+  }
 
   await update("writing embedded SA3 output", 0.85);
   await fs.mkdir(path.dirname(outputPath), { recursive: true });

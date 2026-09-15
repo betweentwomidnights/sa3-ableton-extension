@@ -378,12 +378,26 @@ async function handleCommandError(
   operation: SelectionOperation,
   error: unknown,
 ) {
+  if (isAbortError(error)) {
+    console.log(`[gary-sa3] ${operation} cancelled`);
+    return;
+  }
+
   console.error(`[gary-sa3] ${operation} failed`, error);
   try {
     await showErrorDialog(context, `SA3 ${capitalize(operation)} Failed`, error);
   } catch (dialogError) {
     console.error("[gary-sa3] failed to show error dialog", dialogError);
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const record = error as { name?: unknown; code?: unknown };
+  return record.name === "AbortError" || record.code === "ABORT_ERR";
 }
 
 async function runTransformDialog(

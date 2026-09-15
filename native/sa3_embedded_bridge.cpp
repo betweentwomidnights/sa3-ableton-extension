@@ -10,6 +10,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -69,6 +70,7 @@ struct GenerateWork {
   napi_threadsafe_function tsfn = nullptr;  // optional progress callback bridge
   GenerateOptions options;
   std::string error;
+  std::atomic_bool cancel_requested{false};
   std::string wav_bytes;
   uint64_t seed = 0;
   int sample_rate = 0;
@@ -116,6 +118,9 @@ Sa3Api g_api;
 std::mutex g_context_mutex;
 sa3_context* g_context = nullptr;
 std::string g_context_key;
+
+std::mutex g_generation_state_mutex;
+GenerateWork* g_active_generate_work = nullptr;
 
 void check(napi_status status, const char* message) {
   if (status != napi_ok) {
@@ -497,13 +502,19 @@ void progress_call_js(napi_env env, napi_value js_cb, void* /*context*/, void* d
 
 // Runs on the libsa3 worker thread: queue the tick for the JS thread.
 void SA3_CALL progress_trampoline(void* user, const sa3_progress_v1* progress) {
-  auto tsfn = static_cast<napi_threadsafe_function>(user);
+  auto* work = static_cast<GenerateWork*>(user);
+  auto tsfn = work ? work->tsfn : nullptr;
   if (!tsfn || !progress) return;
   auto* msg = new ProgressMsg{progress->stage_name ? progress->stage_name : "",
                               progress->step, progress->total, (double)progress->fraction};
   if (napi_call_threadsafe_function(tsfn, msg, napi_tsfn_nonblocking) != napi_ok) {
     delete msg;
   }
+}
+
+int32_t SA3_CALL cancel_trampoline(void* user) {
+  auto* work = static_cast<GenerateWork*>(user);
+  return work && work->cancel_requested.load(std::memory_order_relaxed) ? 1 : 0;
 }
 
 void execute_generate(napi_env, void* data) {
@@ -574,8 +585,9 @@ void execute_generate(napi_env, void* data) {
 
     if (work->tsfn) {
       request.on_progress = progress_trampoline;
-      request.callback_user = work->tsfn;
     }
+    request.should_cancel = cancel_trampoline;
+    request.callback_user = work;
 
     if (!init_audio.empty()) {
       request.input_audio.samples = init_audio.data();
@@ -669,6 +681,12 @@ void complete_generate(napi_env env, napi_status, void* data) {
     // Drops our thread-count ref; queued progress ticks still flush first.
     napi_release_threadsafe_function(work->tsfn, napi_tsfn_release);
   }
+  {
+    std::lock_guard<std::mutex> lock(g_generation_state_mutex);
+    if (g_active_generate_work == work) {
+      g_active_generate_work = nullptr;
+    }
+  }
   napi_delete_async_work(env, work->work);
   delete work;
 }
@@ -709,8 +727,50 @@ napi_value generate(napi_env env, napi_callback_info info) {
   napi_value resource_name;
   napi_create_string_utf8(env, "embedded-sa3-generate", NAPI_AUTO_LENGTH, &resource_name);
   napi_create_async_work(env, nullptr, resource_name, execute_generate, complete_generate, work, &work->work);
-  napi_queue_async_work(env, work->work);
+
+  {
+    std::lock_guard<std::mutex> lock(g_generation_state_mutex);
+    if (g_active_generate_work != nullptr) {
+      if (work->tsfn) {
+        napi_release_threadsafe_function(work->tsfn, napi_tsfn_abort);
+      }
+      napi_delete_async_work(env, work->work);
+      delete work;
+      napi_throw_error(env, nullptr, "an embedded SA3 generation is already running");
+      return nullptr;
+    }
+    g_active_generate_work = work;
+  }
+
+  if (napi_queue_async_work(env, work->work) != napi_ok) {
+    {
+      std::lock_guard<std::mutex> lock(g_generation_state_mutex);
+      g_active_generate_work = nullptr;
+    }
+    if (work->tsfn) {
+      napi_release_threadsafe_function(work->tsfn, napi_tsfn_abort);
+    }
+    napi_delete_async_work(env, work->work);
+    delete work;
+    napi_throw_error(env, nullptr, "failed to queue embedded SA3 generation");
+    return nullptr;
+  }
   return promise;
+}
+
+napi_value cancel_generation(napi_env env, napi_callback_info) {
+  bool requested = false;
+  {
+    std::lock_guard<std::mutex> lock(g_generation_state_mutex);
+    if (g_active_generate_work != nullptr) {
+      g_active_generate_work->cancel_requested.store(true, std::memory_order_relaxed);
+      requested = true;
+    }
+  }
+
+  napi_value result;
+  napi_get_boolean(env, requested, &result);
+  return result;
 }
 
 void execute_convert_lora(napi_env, void* data) {
@@ -837,6 +897,7 @@ napi_value diagnostics(napi_env env, napi_callback_info) {
 napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
     {"generate", nullptr, generate, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"cancelGeneration", nullptr, cancel_generation, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"convertLora", nullptr, convert_lora, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"diagnostics", nullptr, diagnostics, nullptr, nullptr, nullptr, napi_default, nullptr},
   };

@@ -2,19 +2,17 @@
 
 stable audio 3 generation, transformation, and continuation directly inside Ableton Live arrangement selections.
 
-> ## ⚗️ experimental branch — embedded sa3.cpp
+> ## embedded sa3.cpp release candidate
 >
-> **this is the experimental branch where we embed [sa3.cpp](https://github.com/betweentwomidnights/sa3.cpp) directly into the extension** — no separate backend process. still iterating; **not merging into `main` just yet.**
+> this version embeds [sa3.cpp](https://github.com/betweentwomidnights/sa3.cpp) directly through its V1 C ABI. there is no backend URL or separate server process.
 >
-> **downloads (v0.1.0, experimental):** [cuda ~575 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-cuda.ablx) · [vulkan ~15 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-vulkan.ablx) · [cpu ~1 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0/gary-extension-cpu.ablx) · [mac ~15 MB](https://github.com/betweentwomidnights/sa3-ableton-extension/releases/download/v0.1.0-metal/gary-extension-metal.ablx)
+> Windows CUDA and Vulkan packages are supported. **TODO:** we need a macOS user to produce and test the Metal package before calling that build supported.
 >
-> this branch now uses the embedded C ABI runtime exclusively. there is no backend URL or separate server mode.
->
-> install with Developer Mode **off** in Ableton Live beta.
+> install the appropriate `.ablx` with Developer Mode **off** in Ableton Live beta.
 
-## embedded sa3.cpp backend (this branch)
+## embedded sa3.cpp backend
 
-this branch embeds `sa3.cpp` directly inside the extension as a native node addon — no separate backend process or backend URL to configure.
+the extension embeds `sa3.cpp` directly as a native node addon — no separate backend process or backend URL to configure.
 
 ### builds (cuda / vulkan / cpu)
 

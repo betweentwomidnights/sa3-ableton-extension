@@ -38,7 +38,8 @@ const releasesDir = path.join(root, "releases");
 fs.mkdirSync(releasesDir, { recursive: true });
 
 backends.forEach((backend, index) => {
-  const env = { GARY_SA3_BACKEND: backend };
+  // Shipped bundles must use sa3.cpp's SA3_PRIVATE_GGML names (see build-native.cjs).
+  const env = { GARY_SA3_BACKEND: backend, GARY_SA3_REQUIRE_PRIVATE_GGML: "1" };
   // The addon is compiled on the first backend and reused for the rest.
   if (index > 0) {
     env.GARY_SA3_SKIP_GYP = "1";

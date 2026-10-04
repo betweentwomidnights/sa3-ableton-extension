@@ -233,9 +233,11 @@ if (platform === "win32") {
   const runtimeDir = defaultSa3RuntimeDir();
   console.log(`[native] copying SA3 runtime from ${runtimeDir}`);
   copyFile(path.join(runtimeDir, "sa3.dll"), outDir);
-  copyGlob(runtimeDir, "ggml*.dll", outDir);
+  // A SA3_PRIVATE_GGML build prefixes ggml's names (sa3-vulkan-<commit>-ggml.dll), so match
+  // anything containing "ggml".
+  copyGlob(runtimeDir, "*ggml*.dll", outDir);
 
-  if (exists(path.join(runtimeDir, "ggml-cuda.dll"))) {
+  if (fs.readdirSync(runtimeDir).some((name) => /ggml-cuda\.dll$/i.test(name))) {
     const cudaDir = process.env.SA3_CUDA_RUNTIME_DIR ||
       (process.env.CUDA_PATH ? path.join(process.env.CUDA_PATH, "bin") : "");
     if (!cudaDir) {
@@ -249,6 +251,21 @@ if (platform === "win32") {
   }
 } else if (platform === "darwin") {
   bundleMacRuntime(outDir);
+}
+
+// The extension host can load other native modules, and Windows binds an import of ggml.dll to
+// any ggml.dll already loaded in the process, from whatever folder. sa3.cpp's SA3_PRIVATE_GGML
+// names ggml after the backend and ggml commit so this bundle only ever shares ggml with a build
+// of the same code. Packaging (scripts/package.cjs) requires it; a dev build only warns.
+const plainGgml = fs.readdirSync(outDir).filter((name) => /^(lib)?ggml[.-]/i.test(name));
+if (plainGgml.length > 0) {
+  const message =
+    `the SA3 runtime uses plain ggml library names (${plainGgml.join(", ")}); ` +
+    "rebuild sa3.cpp with -DSA3_PRIVATE_GGML=ON for anything you ship";
+  if (process.env.GARY_SA3_REQUIRE_PRIVATE_GGML === "1") {
+    throw new Error(message);
+  }
+  console.warn(`[native] warning: ${message}`);
 }
 
 console.log(`[native] embedded SA3 assets ready: ${outDir}`);

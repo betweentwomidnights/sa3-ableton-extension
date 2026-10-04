@@ -40,6 +40,13 @@ the addon itself is backend-agnostic — it `LoadLibrary`s `sa3.dll` at runtime 
 
 note: all three share the extension id `gary.gary-extension`, so only one can be installed at a time — installing a second replaces the first.
 
+> build the `sa3.cpp` runtime you package with `-DSA3_PRIVATE_GGML=ON`. it names
+> ggml's libraries after the backend and ggml commit (`sa3-vulkan-ca7bcb6f-ggml.dll`,
+> `sa3-vulkan-ca7bcb6f-ggml-base.dll`, ...). Windows binds an import of `ggml.dll` to
+> any `ggml.dll` already loaded in the process, so with plain names another native
+> module in the extension host could hand `sa3.dll` a different ggml. `npm run package:*`
+> refuses a runtime with plain names; `npm run build:native` only warns.
+
 > performance is variable, especially on vulkan. the vulkan backend compiles
 > compute shaders on first use, so the *first* init-audio transform/continue
 > after install can take several extra seconds while pipelines build and get

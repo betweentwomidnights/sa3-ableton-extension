@@ -2,7 +2,7 @@
 
 stable audio 3 generation, transformation, and continuation directly inside Ableton Live arrangement selections.
 
-> ## embedded sa3.cpp v0.2.0
+> ## embedded sa3.cpp v0.3.0
 >
 > this version embeds [sa3.cpp](https://github.com/betweentwomidnights/sa3.cpp) directly through its V1 C ABI. there is no backend URL or separate server process.
 >
@@ -28,6 +28,8 @@ the addon itself is backend-agnostic — it `LoadLibrary`s `sa3.dll` at runtime 
 | vulkan | `npm run package:vulkan` | `ggml-vulkan` | ~15 MB | runs on any Vulkan GPU (NVIDIA/AMD/Intel); needs the system Vulkan loader (`vulkan-1.dll`, ships with GPU drivers). basically as fast as CUDA for this workload |
 | cpu    | `npm run package:cpu`    | static `ggml-cpu` | ~3 MB | no GPU needed. slow for `medium`, genuinely usable for `small-music` |
 | metal  | `npm run package:metal`  | `libsa3.dylib` + `ggml` dylibs (`ggml-metal`, `ggml-blas`, `ggml-cpu`, `ggml-base`) | ~15 MB | **macOS / Apple Silicon only**. uses the Metal GPU backend; the Metal shaders are embedded in `libggml-metal.dylib` (no separate `.metallib`). the packager rewrites the dylib rpaths to `@loader_path` and re-adhoc-signs them so the extension host can `dlopen` them |
+
+release runtimes built with `-DSA3_PRIVATE_GGML=ON` often live in their own folder, such as `build-plugin-vulkan-v020`. point `SA3_RUNTIME_DIR` at that folder's `bin/Release` to package from it; it applies to whichever backend you name, so package those one at a time. automation lanes need a sa3.cpp v0.2.0 runtime or newer.
 
 `npm run package:all` builds all three Windows flavours in one pass (compiling the addon once). outputs land in `dist/gary-extension-<backend>.ablx` (also copied into the gitignored `releases/`). the backend is selected at build time with `GARY_SA3_BACKEND=cuda|vulkan|cpu|metal`, mapping to the `sa3.cpp/build-cuda`, `build-vulkan`, `build`, and `build-metal` runtime dirs respectively. `metal` is macOS-only (`npm run package:metal`); the Windows `package:all` does not include it.
 
@@ -109,6 +111,11 @@ to iterate in Ableton's dev host without repackaging each time, `npm run start:w
 runs the extension unsandboxed against a local Live install — set
 `EXTENSION_HOST_PATH` in `.env` to your Live beta path first.
 
+to work on the dialog and real renders without Live, `scripts/dev-harness.cjs` runs the built
+extension against a stand-in for Live's host, with the dialog in a browser. its header says how.
+Live's own side is faked there, so check rendering a track and placing clips in Live.
+`npm test` covers the lane rules and resumable downloads.
+
 ### device toggle (auto / cpu)
 
 the dialog's **settings** view has a **device** dropdown:
@@ -130,13 +137,13 @@ when an `.ablx` is installed normally (Developer Mode off), Live launches the ex
 - `%LOCALAPPDATA%\Ableton\Extensions Data\gary.gary-extension` (per-extension data)
 - `%LOCALAPPDATA%\Temp\Ableton Extensions`
 
-any other path — your `C:\dev\sa3.cpp\models`, your Downloads folder, anywhere — throws `ERR_ACCESS_DENIED` at the fs layer. that is why there is no "browse for models folder" button: a picked path outside the sandbox would be unreadable anyway. instead, the dialog has **models folder** / **loras folder** reveal buttons that open the sandbox locations in Explorer so you can copy files in.
+any other path — your `C:\dev\sa3.cpp\models`, your Downloads folder, anywhere — throws `ERR_ACCESS_DENIED` at the fs layer. that is why there is no "browse for models folder" button: a picked path outside the sandbox would be unreadable anyway. instead, the dialog has **models folder** / **loras folder** reveal buttons that open the sandbox locations in Explorer so you can copy files in. **import folder** and **import files** can bring a lora in from anywhere, because the dialog reads the files itself and hands over their bytes.
 
 developer mode (`npm start`) runs the host unsandboxed, so external paths work there. don't be fooled while testing.
 
 ### models
 
-press **download** in the dialog to fetch the selected variant (`medium`, `small-music`, `small-sfx`) from Hugging Face into `Extensions Data\gary.gary-extension\models`. variants that are fully present are marked with a ✓ in the variant dropdown, and the extension auto-selects an available variant on open if the current one is missing.
+with no models, the run button stays disabled and a hint under it offers to download `medium` or `small-music`. the button comes back on its own once models appear, whether they downloaded or you copied them in. **download** in settings fetches the selected variant (`medium`, `small-music`, `small-sfx`) from Hugging Face into `Extensions Data\gary.gary-extension\models`. cancelling keeps what's there, and downloading again picks up where it stopped. variants that are fully present are marked with a ✓ in the variant dropdown, and the extension auto-selects an available variant on open if the current one is missing.
 
 already have the ggufs? press **models folder** and copy them in. the checker matches files by prefix/suffix glob (e.g. `stable-audio-3-medium-dit-*-F16.gguf`), so upstream version bumps in filenames are fine.
 
@@ -151,25 +158,52 @@ loras/
       kev.safetensors    <- required
       kev.json           <- required (adapter metadata)
       *.txt              <- optional: one caption per file, feeds the dice button
+      prompts.json       <- optional: a prompt pool, also feeds the dice button
     keygen/
       ...
   small-music/
     <loras trained on small-music>
 ```
 
-so a `medium` lora is not offered while `small-music` is selected, and vice versa. detection is automatic — no import step. the first time a lora is used for generation it is converted to gguf next to its safetensors (`kev/kev-f32.gguf`) and reused after that (reconverted if the safetensors is newer). a plain `lora-<name>-f32.gguf` dropped into the variant folder also works.
+so a `medium` lora is not offered while `small-music` is selected, and vice versa. detection is automatic — no import step, and a folder dropped in while the dialog is open shows up within a couple of seconds. the first time a lora is used for generation it is converted to gguf next to its safetensors (`kev/kev-f32.gguf`) and reused after that (reconverted if the safetensors is newer). a plain `lora-<name>-f32.gguf` dropped into the variant folder also works.
 
-the `.txt` files are the captions from your training dataset. when a lora is active, the **dice** button rolls prompts from those captions instead of the generic pool. no txt files means dice falls back to the built-in generic pool and reports the lora pool as missing.
+the `.txt` files are the captions from your training dataset. `prompts.json` is the same thing as one file, in the shape of sa3.cpp's `prompts/<lora>.json`, so that file can be copied in under this name. it can't be called `<lora>.json`, because that's the adapter's own settings. when a lora is active, the **dice** button rolls prompts from its pool as well as the generic pool. no pool means a lane's dice has nothing to roll and says so.
 
 prefix a lora folder with `_` or `.` to disable it without deleting it.
 
-a future idea is a hugging face lora registry with a "download loras" button; for now, copy folders in by hand.
+**import folder** does the same from anywhere on disk: choose a folder laid out like the ones above and the lora takes its name. only what's directly inside is read, so a dataset's audio and subfolders are left alone. it converts right away and reports any problem, and if the `.json` settings are missing it asks for that file.
+
+**import files**, or dropping files onto the dialog, covers the rest: a single `.gguf`, or prompts kept somewhere else. a sa3.cpp pool named `<lora>.json` goes to that lora by name, and for anything else it asks which.
+
+the **×** on a lora's row deletes it, after asking. that takes its adapters, settings and prompts, and leaves anything else in its folder alone.
+
+a future idea is a hugging face lora registry with a "download loras" button.
+
+### automation lanes
+
+the **automation** button gives every lora on the list its own lane (up to 8), flat at its slider's value, and locks the sliders. a lane's height is that lora's strength, 0 to 2. nothing changes until you draw. the loop is: lock the seed, adjust the curves, render again.
+
+- click to add a point and drag it. double-click or right-click a point to remove it. shift-drag draws freehand.
+- **snap** lands dragged points on 1/4, 1/2 or 1 bar, and freehand strokes stay free. ctrl steps the other way: free of the division while one is chosen, onto the beat while none is.
+- **one song** forms the arrangement from each lane's average and then applies the curves. **distinct** holds the sections further apart.
+- each lane has its own prompt and dice. an empty prompt uses the base prompt. dice rolls from that lora's own captions. the base dice stays on the default pool while automation is on.
+- curves span the selection, or the added part with continue. tempo and key are added to every prompt.
+- a lora with a lane no longer runs at a fixed strength. a lora that can't run in a lane, such as one that targets the decoder, stays at its slider.
+
+the dialog remembers your curves, the automation toggle and its settings from one run to the next, across every Live set. a modal keeps the size it opened with, so turning automation on closes the dialog and reopens it wider. once a render starts, the dialog closes and Live's progress dialog takes over.
+
+what Live's extension API doesn't allow, compared with the REAPER extension:
+
+- **no playback cursor.** the API has no transport, so nothing can follow Live's playhead.
+- **no per-set state.** the API has no storage in a set and no set name, so lanes are remembered for the extension rather than for each set.
+- **no time signature.** the API doesn't expose the set's meter, so choose it with the **meter** dropdown. it's what bars, bar snap and grid lines count from, and it defaults to 4/4.
+- **no folder or file picker.** see the sandbox section above. loras go into the folder the **folder** button opens.
 
 ### decoder correction
 
 the settings view can download and toggle the published `squeakfix_v3` decoder correction. it is applied at strength 1 only when the selected generation model is `medium` (SAME-L). the preference remains saved while a SAME-S model is selected, but the adapter is never passed to an incompatible small model.
 
-the advanced **ends here / keeps going** setting controls V1's tail padding for generate and continue. **ends here** uses zero seconds so the model plans an ending at the clip boundary; **keeps going** generates six seconds beyond the requested clip and trims the extra audio, so the requested boundary can remain in full motion.
+the **ends here / keeps going** setting controls V1's tail padding for generate and continue. **ends here** uses zero seconds so the model plans an ending at the clip boundary; **keeps going** generates six seconds beyond the requested clip and trims the extra audio, so the requested boundary can remain in full motion.
 
 ### output processing
 

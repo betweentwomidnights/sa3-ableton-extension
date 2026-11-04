@@ -28,6 +28,12 @@ struct LoraOption {
   float strength = 1.0f;
 };
 
+struct LaneOption {
+  std::string lora_path;
+  std::string prompt;
+  std::vector<float> envelope;  // (seconds, amount) pairs
+};
+
 struct GenerateOptions {
   std::string models_dir;
   std::string adapters_dir;
@@ -61,6 +67,10 @@ struct GenerateOptions {
   int decode_overlap = 32;
 
   std::vector<LoraOption> loras;
+  std::vector<LaneOption> lanes;
+  float lane_isolation = 1.0f;
+  float lane_isolation_until = 0.0f;
+  float lane_average_until = 0.9f;
 };
 
 struct GenerateWork {
@@ -226,6 +236,52 @@ std::vector<LoraOption> get_loras(napi_env env, napi_value object) {
   return result;
 }
 
+std::vector<float> get_float_array(napi_env env, napi_value object, const char* key) {
+  std::vector<float> result;
+  napi_value value;
+  if (!get_property(env, object, key, &value)) return result;
+  bool is_array = false;
+  check(napi_is_array(env, value, &is_array), "failed to inspect number array");
+  if (!is_array) return result;
+
+  uint32_t length = 0;
+  check(napi_get_array_length(env, value, &length), "failed to read number array length");
+  result.reserve(length);
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value item;
+    check(napi_get_element(env, value, i, &item), "failed to read number array element");
+    double number = 0.0;
+    check(napi_get_value_double(env, item, &number), "number array holds a non-number");
+    result.push_back((float)number);
+  }
+  return result;
+}
+
+std::vector<LaneOption> get_lanes(napi_env env, napi_value object) {
+  std::vector<LaneOption> result;
+  napi_value value;
+  if (!get_property(env, object, "lanes", &value)) return result;
+  bool is_array = false;
+  check(napi_is_array(env, value, &is_array), "failed to inspect lanes");
+  if (!is_array) return result;
+
+  uint32_t length = 0;
+  check(napi_get_array_length(env, value, &length), "failed to read lane count");
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value item;
+    check(napi_get_element(env, value, i, &item), "failed to read lane");
+    LaneOption lane;
+    lane.lora_path = get_string(env, item, "loraPath", "");
+    lane.prompt = get_string(env, item, "prompt", "");
+    lane.envelope = get_float_array(env, item, "envelope");
+    if (lane.envelope.size() < 2 || lane.envelope.size() % 2 != 0) {
+      throw std::runtime_error("a lane envelope must hold (seconds, amount) pairs");
+    }
+    result.push_back(std::move(lane));
+  }
+  return result;
+}
+
 GenerateOptions parse_generate_options(napi_env env, napi_value value) {
   napi_valuetype type;
   check(napi_typeof(env, value, &type), "failed to inspect options");
@@ -265,6 +321,10 @@ GenerateOptions parse_generate_options(napi_env env, napi_value value) {
   options.decode_chunk_size = get_int(env, value, "decodeChunkSize", options.decode_chunk_size);
   options.decode_overlap = get_int(env, value, "decodeOverlap", options.decode_overlap);
   options.loras = get_loras(env, value);
+  options.lanes = get_lanes(env, value);
+  options.lane_isolation = (float)get_double(env, value, "laneIsolation", options.lane_isolation);
+  options.lane_isolation_until = (float)get_double(env, value, "laneIsolationUntil", options.lane_isolation_until);
+  options.lane_average_until = (float)get_double(env, value, "laneAverageUntil", options.lane_average_until);
 
   if (!std::isfinite(options.duration) || options.duration <= 0.0) {
     throw std::runtime_error("duration must be positive");
@@ -578,6 +638,43 @@ void execute_generate(napi_env, void* data) {
     request.loudness.latent_shift = 0.0f;
     request.adapters = adapters.empty() ? nullptr : adapters.data();
     request.adapter_count = (uint32_t)adapters.size();
+
+    // Declared here so they outlive generate(), which only reads them through the request.
+    std::vector<sa3_adapter_v1> lane_adapters(work->options.lanes.size());
+    std::vector<sa3_lane_v1> lanes(work->options.lanes.size());
+    if (!lanes.empty()) {
+      // A library without lane_init would ignore the lane fields and render without them.
+      if (!api.api->lane_init) {
+        work->error = "this libsa3 predates automation lanes";
+        return;
+      }
+      for (size_t i = 0; i < lanes.size(); ++i) {
+        const LaneOption& option = work->options.lanes[i];
+        sa3_lane_v1& lane = lanes[i];
+        lane = {};
+        lane.size = sizeof(lane);
+        api.api->lane_init(&lane);
+        if (!option.lora_path.empty()) {
+          sa3_adapter_v1& adapter = lane_adapters[i];
+          adapter = {};
+          adapter.size = sizeof(adapter);
+          api.api->adapter_init(&adapter);
+          adapter.path_or_name = option.lora_path.c_str();
+          lane.adapters = &adapter;
+          lane.adapter_count = 1;
+        }
+        lane.envelope = option.envelope.data();
+        lane.envelope_point_count = (uint32_t)(option.envelope.size() / 2);
+        lane.prompt = option.prompt.empty() ? nullptr : option.prompt.c_str();
+      }
+      request.lanes = lanes.data();
+      request.lane_count = (uint32_t)lanes.size();
+      request.lane_isolation = work->options.lane_isolation;
+      request.lane_isolation_until = work->options.lane_isolation_until;
+      request.lane_average_until = work->options.lane_average_until;
+      // On 8 GB, the DiT, every lane's adapters and the decoder together oversubscribe VRAM.
+      request.residency = SA3_RESIDENCY_FRUGAL_V1;
+    }
     request.encode_chunk_size = work->options.encode_chunk_size;
     request.encode_overlap = work->options.encode_overlap;
     request.decode_chunk_size = work->options.decode_chunk_size;
@@ -860,6 +957,60 @@ napi_value convert_lora(napi_env env, napi_callback_info info) {
   return promise;
 }
 
+// Reads an adapter's target from its file. Returns null when the library can't answer, which means
+// it predates lanes.
+napi_value adapter_info(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  check(napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr), "failed to read adapterInfo args");
+  napi_value null_value;
+  napi_get_null(env, &null_value);
+  if (argc < 1) {
+    napi_throw_type_error(env, nullptr, "adapterInfo(path) requires a path");
+    return nullptr;
+  }
+
+  std::string load_error;
+  if (!load_sa3_api(load_error)) return null_value;
+  Sa3Api api;
+  {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    api = g_api;
+  }
+  if (!api.api->adapter_info) return null_value;
+
+  std::string path;
+  try {
+    path = utf8_from_value(env, argv[0]);
+  } catch (const std::exception& e) {
+    napi_throw_type_error(env, nullptr, e.what());
+    return nullptr;
+  }
+
+  sa3_adapter_info_v1 adapter = {};
+  adapter.size = sizeof(adapter);
+  sa3_error_v1 error = {};
+  error.size = sizeof(error);
+  api.api->error_init(&error);
+  if (api.api->adapter_info(path.c_str(), &adapter, &error) != SA3_STATUS_OK_V1) {
+    napi_throw_error(env, nullptr, error.message[0] ? error.message : "could not read the adapter");
+    return nullptr;
+  }
+
+  napi_value result;
+  napi_create_object(env, &result);
+  napi_value target;
+  napi_create_string_utf8(env,
+    adapter.target == SA3_ADAPTER_TARGET_DECODER_V1 ? "decoder"
+    : adapter.target == SA3_ADAPTER_TARGET_ENCODER_V1 ? "encoder" : "dit",
+    NAPI_AUTO_LENGTH, &target);
+  napi_set_named_property(env, result, "target", target);
+  napi_value supports_lanes;
+  napi_get_boolean(env, adapter.supports_lanes != 0, &supports_lanes);
+  napi_set_named_property(env, result, "supportsLanes", supports_lanes);
+  return result;
+}
+
 napi_value diagnostics(napi_env env, napi_callback_info) {
   napi_value result;
   napi_create_object(env, &result);
@@ -885,6 +1036,10 @@ napi_value diagnostics(napi_env env, napi_callback_info) {
     napi_value native_dir;
     napi_create_string_utf8(env, api.native_dir.c_str(), NAPI_AUTO_LENGTH, &native_dir);
     napi_set_named_property(env, result, "nativeDir", native_dir);
+
+    napi_value supports_lanes;
+    napi_get_boolean(env, api.api && api.api->lane_init != nullptr, &supports_lanes);
+    napi_set_named_property(env, result, "supportsLanes", supports_lanes);
   } else {
     napi_value reason;
     napi_create_string_utf8(env, error.c_str(), NAPI_AUTO_LENGTH, &reason);
@@ -899,6 +1054,7 @@ napi_value init(napi_env env, napi_value exports) {
     {"generate", nullptr, generate, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"cancelGeneration", nullptr, cancel_generation, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"convertLora", nullptr, convert_lora, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"adapterInfo", nullptr, adapter_info, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"diagnostics", nullptr, diagnostics, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties);

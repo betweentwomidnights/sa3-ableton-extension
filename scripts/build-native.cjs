@@ -75,6 +75,15 @@ function selectedBackend() {
 function defaultSa3RuntimeDir() {
   const sa3CppDir = process.env.SA3_CPP_DIR || path.resolve(root, "..", "sa3.cpp");
   const backend = selectedBackend();
+  // Named explicitly, a runtime wins over the backend's default folder: release runtimes are built
+  // with SA3_PRIVATE_GGML in their own folders, such as build-plugin-vulkan-v020.
+  if (process.env.SA3_RUNTIME_DIR) {
+    const dir = process.env.SA3_RUNTIME_DIR;
+    if (!exists(path.join(dir, "sa3.dll"))) {
+      throw new Error(`SA3_RUNTIME_DIR is set but sa3.dll not found in ${dir}`);
+    }
+    return dir;
+  }
   if (backend) {
     const dir = path.join(sa3CppDir, BACKEND_DIRS[backend], "bin", "Release");
     if (!exists(path.join(dir, "sa3.dll"))) {
@@ -84,7 +93,6 @@ function defaultSa3RuntimeDir() {
   }
 
   const candidates = [
-    process.env.SA3_RUNTIME_DIR,
     path.join(sa3CppDir, "build-cuda", "bin", "Release"),
     path.join(sa3CppDir, "build-vulkan", "bin", "Release"),
     path.join(sa3CppDir, "build", "bin", "Release"),

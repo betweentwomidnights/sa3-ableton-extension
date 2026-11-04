@@ -1,6 +1,6 @@
 {
   "name": "gary-extension",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "main": "dist/extension.js",
@@ -17,7 +17,8 @@
     "start": "npm run start:cli",
     "start:cli": "npm run build && extensions-cli run",
     "start:debug": "npm run build && extensions-cli run --inspect",
-    "start:win": "npm run build && node scripts/run-dev-host.cjs"
+    "start:win": "npm run build && node scripts/run-dev-host.cjs",
+    "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@ableton-extensions/sdk": "file:vendor/ableton-extensions-sdk-1.0.0-beta.0.tgz"

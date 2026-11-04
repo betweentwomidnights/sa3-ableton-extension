@@ -7,19 +7,19 @@
   <script>
     const initial = __INITIAL_JSON__;
     let availableLoras = initial.availableLoras || [];
+    let laneSupport = initial.laneSupport || {};
     let decoderPreference = initial.decoderLoraEnabled !== false;
-    const isWebKitMessageHandlerAvailable = window.webkit &&
-      window.webkit.messageHandlers &&
-      window.webkit.messageHandlers.live;
-    const isWebView2 = window.chrome && window.chrome.webview;
+    let basePrompt = initial.prompt || "";
+    let negativePrompt = initial.negativePrompt || "";
     let saveTimer = 0;
     let modelPollTimer = 0;
     let decoderPollTimer = 0;
+    let modelStatus = null;
 
     function sendMessage(message) {
-      if (isWebKitMessageHandlerAvailable) {
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.live) {
         window.webkit.messageHandlers.live.postMessage(message);
-      } else if (isWebView2) {
+      } else if (window.chrome && window.chrome.webview) {
         window.chrome.webview.postMessage(message);
       }
     }
@@ -59,18 +59,26 @@
         limiter: checked("limiter"),
         limiterCeilingDb: Number(value("limiterCeilingDb")),
         limiterKnee: Number(value("limiterKnee")),
-        prompt: value("prompt"),
+        prompt: basePrompt.trim(),
         strength: Number(value("strength")),
         steps: Number(value("steps")),
         cfgScale: Number(value("cfgScale")),
         shift: value("shift"),
-        negativePrompt: value("negativePrompt"),
+        negativePrompt: negativePrompt.trim(),
         seed: value("seed") ? Number(value("seed")) : -1,
         useSeed: checked("useSeed"),
         lastSeed: initial.lastSeed || "",
         replaceSelection: checked("replaceSelection"),
         continueBeats: continueBarsToBeats(continueBars),
-        loras: readLoras()
+        loras: readLoras(),
+        keyRoot: Number(value("keyRoot")),
+        keyMode: Number(value("keyMode")),
+        meter: value("meter"),
+        automationOn,
+        laneBlend,
+        laneSnap,
+        lanes,
+        lastRender: initial.lastRender || null
       };
     }
 
@@ -99,17 +107,16 @@
       }, 250);
     }
 
+    // Strengths for LoRAs not on the list stay saved: they belong to another model family.
     function readLoras() {
-      if (!checked("useLoras")) {
-        return [];
-      }
-
-      return Array.from(document.querySelectorAll(".lora-slider"))
+      const listed = Array.from(document.querySelectorAll(".lora-slider"))
         .map((slider) => ({
           name: slider.dataset.name,
           strength: Number(slider.value)
         }))
         .filter((lora) => lora.name && lora.strength > 0);
+      const others = (initial.loras || []).filter((lora) => !availableLoras.includes(lora.name));
+      return listed.concat(others);
     }
 
     function closeWithAction(action) {
@@ -125,11 +132,16 @@
     }
 
     function setStatus(text) {
-      el("loraStatus").textContent = text || "";
+      statusMessage = text || "";
+      importStatus = "";
+      importFailed = false;
+      updateStatusLine();
     }
 
     function activeLoraNames() {
-      return readLoras().map((lora) => lora.name).filter(Boolean);
+      return readLoras()
+        .map((lora) => lora.name)
+        .filter((name) => availableLoras.includes(name));
     }
 
     function setHealth(text, state) {
@@ -201,97 +213,159 @@
       node.dataset.state = state || "";
     }
 
-    function renderEmbeddedModelStatus(status) {
-      const download = status && status.download && status.download.active ? status.download : status;
-      const active = Boolean(download && download.active);
+    let statusMessage = "";
+    let importStatus = "";
+    let importFailed = false;
+
+    // An import can run before there are any models, so it shows alongside the hint, not under it.
+    function setImportStatus(text, failed) {
+      importStatus = text || "";
+      importFailed = Boolean(failed);
+      updateStatusLine();
+    }
+
+    function modelsReady() {
+      return Boolean(modelStatus && modelStatus.complete);
+    }
+
+    function downloadActive() {
+      return Boolean(modelStatus && modelStatus.download && modelStatus.download.active);
+    }
+
+    function downloadPercent() {
+      return Math.round(Number(modelStatus.download.progress || 0) * 100);
+    }
+
+    // The folder is the sandbox's, not one you pick: Live's extension host can't read anywhere else.
+    function noModelsText() {
+      return `No ${value("embeddedVariant")} models found. Download them, or copy them into the models folder in settings.`;
+    }
+
+    function downloadOutcome() {
+      const download = modelStatus && modelStatus.download;
+      if (!download || download.active || download.variant !== value("embeddedVariant")) {
+        return "";
+      }
+      return download.error || (download.done ? "" : download.label) || "";
+    }
+
+    // Directly under the run button, so what's stopping a run is next to it.
+    function updateStatusLine() {
+      const node = el("status");
+      const failed = Boolean(modelStatus && modelStatus.download && !modelStatus.download.active
+        && modelStatus.download.error && modelStatus.download.variant === value("embeddedVariant"));
+      let text = statusMessage;
+      if (downloadActive()) {
+        text = `${downloadPercent()}% ${modelStatus.download.label || "downloading"}`;
+      } else if (modelStatus && !modelStatus.complete) {
+        text = downloadOutcome() || noModelsText();
+      }
+      if (importStatus) {
+        text = downloadActive() || (modelStatus && !modelStatus.complete) ? `${importStatus}. ${text}` : importStatus;
+      }
+      node.textContent = text;
+      node.dataset.state = failed || importFailed ? "offline" : "";
+    }
+
+    function updateRunState() {
+      const ready = modelsReady() && !downloadActive();
+      el("actionButton").disabled = !ready;
+      el("modelsHint").hidden = modelsReady();
+      const active = downloadActive();
+      el("hintDownloadMedium").hidden = active;
+      el("hintDownloadSmall").hidden = active;
+      el("hintCancel").hidden = !active;
+      updateStatusLine();
+    }
+
+    function renderEmbeddedModelStatus() {
+      const status = modelStatus;
+      const active = downloadActive();
       const button = el("embeddedModelsDownload");
       button.dataset.active = active ? "true" : "false";
       button.textContent = active ? "cancel" : "download";
+      updateRunState();
 
-      if (!download) {
+      if (!status) {
         setEmbeddedModelStatus("not checked", "");
         return;
       }
-
-      if (download.error) {
-        setEmbeddedModelStatus(download.error, "offline");
-        return;
-      }
-
       if (active) {
-        const pct = Math.round(Number(download.progress || 0) * 100);
-        setEmbeddedModelStatus(`${pct}% ${download.label || "downloading"}`, "pending");
+        setEmbeddedModelStatus(`${downloadPercent()}% ${status.download.label || "downloading"}`, "pending");
         return;
       }
-
-      if (download.complete) {
-        setEmbeddedModelStatus(`${download.variant || value("embeddedVariant")} ${download.encoding || value("embeddedEncoding")} ready`, "online");
+      if (status.complete) {
+        setEmbeddedModelStatus(`${status.variant || value("embeddedVariant")} ${status.encoding || value("embeddedEncoding")} ready`, "online");
         return;
       }
-
-      const missing = Array.isArray(download.missing) && download.missing.length > 0
-        ? download.missing.join(", ")
+      const outcome = downloadOutcome();
+      if (outcome) {
+        setEmbeddedModelStatus(outcome, status.download.error ? "offline" : "");
+        return;
+      }
+      const missing = Array.isArray(status.missing) && status.missing.length > 0
+        ? status.missing.join(", ")
         : "models";
       setEmbeddedModelStatus(`missing ${missing}`, "offline");
     }
 
     async function checkEmbeddedModels() {
+      clearTimeout(modelPollTimer);
+      const wasReady = modelsReady();
+      const wasChecked = modelStatus !== null;
       try {
         const json = await fetchJsonWithTimeout(appendQuery("/api/embedded/models/status", embeddedOptions()), 8000);
         if (!json.success) {
           throw new Error(errorFromResponse(json, "model check failed"));
         }
-        renderEmbeddedModelStatus(json);
+        modelStatus = json;
+        renderEmbeddedModelStatus();
         applyEmbeddedDetection(json);
-        if (json.download && json.download.active) {
-          scheduleEmbeddedModelPoll();
+        if (!wasReady && wasChecked && modelsReady()) {
+          setStatus(`${value("embeddedVariant")} models ready`);
+          void checkBackendHealth();
+          void refreshLorasInPlace();
         }
       } catch (error) {
         setEmbeddedModelStatus("model check failed", "offline");
       }
-    }
-
-    function scheduleEmbeddedModelPoll() {
-      clearTimeout(modelPollTimer);
-      modelPollTimer = setTimeout(() => {
-        void pollEmbeddedModels();
-      }, 1000);
-    }
-
-    async function pollEmbeddedModels() {
-      try {
-        const json = await fetchJsonWithTimeout(appendQuery("/api/embedded/models/status", embeddedOptions()), 8000);
-        renderEmbeddedModelStatus(json);
-        applyEmbeddedDetection(json);
-        if (json.download && json.download.active) {
-          scheduleEmbeddedModelPoll();
-        } else {
-          void checkBackendHealth();
-          void refreshLorasInPlace();
-        }
-      } catch {
-        scheduleEmbeddedModelPoll();
+      // Keeps checking while there's nothing to run with, so models copied into the folder are
+      // picked up without a click.
+      if (!modelsReady() || downloadActive()) {
+        modelPollTimer = setTimeout(() => void checkEmbeddedModels(), downloadActive() ? 1000 : 2000);
       }
+    }
+
+    async function startModelDownload(variant) {
+      if (variant && variant !== value("embeddedVariant")) {
+        el("embeddedVariant").value = variant;
+        el("embeddedVariant").dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      try {
+        const json = await postJsonWithTimeout("/api/embedded/models/download", embeddedOptions(), 30000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, "download failed"));
+        }
+        void checkEmbeddedModels();
+      } catch (error) {
+        setEmbeddedModelStatus(error instanceof Error ? error.message : "download failed", "offline");
+      }
+    }
+
+    async function cancelModelDownload() {
+      try {
+        await postJsonWithTimeout("/api/embedded/models/cancel", embeddedOptions(), 8000);
+      } catch {
+        // The next check reports where it stands either way.
+      }
+      void checkEmbeddedModels();
     }
 
     async function downloadOrCancelEmbeddedModels() {
       const button = el("embeddedModelsDownload");
       button.disabled = true;
-
       try {
-        const active = button.dataset.active === "true";
-        const json = active
-          ? await postJsonWithTimeout("/api/embedded/models/cancel", embeddedOptions(), 8000)
-          : await postJsonWithTimeout("/api/embedded/models/download", embeddedOptions(), 30000);
-        if (!json.success) {
-          throw new Error(errorFromResponse(json, active ? "cancel failed" : "download failed"));
-        }
-        renderEmbeddedModelStatus(json);
-        if (json.active || !active) {
-          scheduleEmbeddedModelPoll();
-        }
-      } catch (error) {
-        setEmbeddedModelStatus(error instanceof Error ? error.message : "download failed", "offline");
+        await (button.dataset.active === "true" ? cancelModelDownload() : startModelDownload());
       } finally {
         button.disabled = false;
       }
@@ -447,10 +521,11 @@
     async function rollDiceInPlace() {
       const button = el("diceButton");
       button.disabled = true;
-      setStatus(readLoras().length > 0 ? "rolling lora prompt..." : "rolling prompt...");
+      // With automation on, each lane rolls its own LoRA's prompts, so this one stays on the defaults.
+      const loras = automationOn ? [] : activeLoraNames();
+      setStatus(loras.length > 0 ? "rolling lora prompt..." : "rolling prompt...");
 
       try {
-        const loras = activeLoraNames();
         const url = appendQuery("/api/prompts", {
           ...embeddedOptions(),
           ...(loras.length > 0 ? { lora: loras.join(",") } : {})
@@ -461,11 +536,12 @@
           throw new Error(errorFromResponse(json, "failed to roll prompt"));
         }
         const missingLoras = Array.isArray(json.missingLoras) ? json.missingLoras : [];
-        el("prompt").value = json.prompt;
+        basePrompt = json.prompt;
+        renderPromptBoxes();
         persistSettingsSoon();
         setStatus(missingLoras.length > 0
           ? `rolled prompt; missing ${missingLoras.length} lora pool${missingLoras.length === 1 ? "" : "s"}`
-          : loras.length > 0 ? "rolled lora prompt" : "rolled prompt");
+          : loras.length > 0 ? "rolled from the default and active lora prompts" : "rolled a default prompt");
       } catch (error) {
         setStatus("rolling via extension host...");
         await persistSettingsNow();
@@ -530,14 +606,10 @@
       const rows = el("loraRows");
       rows.replaceChildren();
 
-      el("useLoras").disabled = names.length === 0;
-      el("useLoras").checked = names.some((name) => (active.get(name) || 0) > 0);
-      el("advanced").open = el("useLoras").checked;
-
       if (names.length === 0) {
         const empty = document.createElement("div");
         empty.className = "muted full";
-        empty.textContent = "none";
+        empty.textContent = "none yet: use import folder, or copy lora folders into open folder";
         rows.append(empty);
         return;
       }
@@ -559,6 +631,8 @@
         slider.step = "0.01";
         slider.value = String(active.get(name) || 0);
         slider.dataset.name = name;
+        slider.disabled = automationOn;
+        slider.title = automationOn ? "automation is on: its lane sets the strength" : "";
 
         const amount = document.createElement("span");
         amount.className = "lora-value";
@@ -566,35 +640,99 @@
 
         slider.addEventListener("input", () => {
           amount.textContent = Number(slider.value).toFixed(2);
-          if (Number(slider.value) > 0) {
-            el("useLoras").checked = true;
-          }
         });
 
-        row.append(label, slider, amount);
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "lora-remove";
+        remove.textContent = "\u00d7";
+        remove.title = `remove ${name}`;
+        remove.addEventListener("click", () => askToRemoveLora(row, name));
+
+        row.append(label, slider, amount, remove);
         rows.append(row);
       }
-
-      updateLoraVisibility();
     }
 
-    function currentLoraStrengths() {
-      const sliders = Array.from(document.querySelectorAll(".lora-slider"));
-      if (sliders.length > 0) {
-        return new Map(sliders.map((slider) => [slider.dataset.name, Number(slider.value)]));
+    // Asks on the row itself, because this deletes files.
+    function askToRemoveLora(row, name) {
+      const ask = document.createElement("div");
+      ask.className = "lora-ask";
+      const text = document.createElement("span");
+      text.textContent = "delete its files?";
+      const yes = document.createElement("button");
+      yes.type = "button";
+      yes.textContent = "delete";
+      yes.addEventListener("click", () => void removeLora(name));
+      const no = document.createElement("button");
+      no.type = "button";
+      no.textContent = "keep";
+      no.addEventListener("click", () => {
+        ask.remove();
+        row.classList.remove("asking");
+      });
+      ask.append(text, yes, no);
+      row.classList.add("asking");
+      row.append(ask);
+    }
+
+    async function removeLora(name) {
+      closePromptOverlay(true);
+      closeImportRow();
+      closeSettingsRow();
+      try {
+        const response = await fetch(appendQuery("/api/embedded/loras/remove", {
+          ...embeddedOptions(), name
+        }), { method: "POST", headers: { "X-Gary-Import": "1" } });
+        const json = await response.json();
+        if (!response.ok || !json.success) {
+          throw new Error(errorFromResponse(json, `couldn't remove ${name}`));
+        }
+        // Otherwise its strength and lane would come back if it's imported again.
+        initial.loras = (initial.loras || []).filter((lora) => lora.name !== name);
+        lanes = lanes.filter((lane) => lane.name !== name);
+        await refreshLorasInPlace();
+        setImportStatus(json.itemsLeft > 0
+          ? `${name} removed; left ${plural(json.itemsLeft, "other item")} in its folder`
+          : `${name} removed`);
+      } catch (error) {
+        renderLoras();
+        setImportStatus(error instanceof Error ? error.message : `couldn't remove ${name}`, true);
       }
-
-      return new Map((initial.loras || []).map((lora) => [lora.name, Number(lora.strength)]));
     }
 
-    function updateLoraVisibility() {
-      const enabled = checked("useLoras");
-      el("loraRows").classList.toggle("disabled", !enabled);
+    // The sliders win, and a saved strength covers a lora that has only just come back on the list.
+    function currentLoraStrengths() {
+      const strengths = new Map((initial.loras || []).map((lora) => [lora.name, Number(lora.strength)]));
+      for (const slider of document.querySelectorAll(".lora-slider")) {
+        strengths.set(slider.dataset.name, Number(slider.value));
+      }
+      return strengths;
+    }
+
+    // Folders dropped in while the dialog is open show up without a click. It waits for your hand to
+    // be free, since redrawing the list would drop a slider or point you're dragging.
+    function watchLoraFolder() {
+      setTimeout(async () => {
+        try {
+          const busy = promptOverlayOpen() || document.querySelector("canvas:active, input:active");
+          if (!busy) {
+            const json = await fetchJsonWithTimeout(appendQuery("/api/loras", {
+              ...embeddedOptions(),
+              namesOnly: "1"
+            }), 8000);
+            if (json.success && JSON.stringify(json.loras) !== JSON.stringify(availableLoras)) {
+              await refreshLorasInPlace();
+            }
+          }
+        } catch {
+          // The next look will do.
+        }
+        watchLoraFolder();
+      }, 2000);
     }
 
     async function refreshLorasInPlace() {
-      const button = el("refreshLoras");
-      button.disabled = true;
       setStatus("refreshing loras...");
 
       try {
@@ -606,15 +744,18 @@
         }
 
         availableLoras = json.loras;
+        laneSupport = json.laneSupport || {};
         setStatus(json.statusMessage || "");
         renderLoras();
+        if (automationOn) {
+          syncLanes();
+          renderLanes();
+        }
         persistSettingsSoon();
       } catch (error) {
         setStatus("refreshing via extension host...");
         await persistSettingsNow();
         closeWithAction("refresh-loras");
-      } finally {
-        button.disabled = false;
       }
     }
 
@@ -643,8 +784,11 @@
       return "transform";
     }
 
+    // Live's beats are quarter notes, so a bar of 6/8 is 3 of them. The SDK doesn't expose the set's
+    // meter, so it's chosen here.
     function beatsPerBar() {
-      return Number(initial.beatsPerBar) > 0 ? Number(initial.beatsPerBar) : 4;
+      const [numerator, denominator] = value("meter").split("/").map(Number);
+      return numerator && denominator ? (numerator * 4) / denominator : 4;
     }
 
     function continueBarsToBeats(bars) {
@@ -662,12 +806,13 @@
       el("shell").dataset.operation = mode;
       document.title = isGenerate ? "SA3 Generate" : isContinue ? "SA3 Continue" : "SA3 Transform";
       el("title").textContent = isGenerate ? "SA3 Generate" : isContinue ? "SA3 Continue" : "SA3 Transform";
-      el("prompt").placeholder = isGenerate
+      el("promptBox").dataset.placeholder = isGenerate
         ? "describe the audio to generate"
         : isContinue
           ? "where should this section go next"
           : "warm shoegaze guitars";
       el("actionButton").textContent = isGenerate ? "Generate" : isContinue ? "Continue" : "Transform";
+      el("columns").dataset.split = automationOn ? "true" : "false";
       el("replaceSelection").checked = isGenerate || isContinue ? true : Boolean(initial.replaceSelection);
     }
 
@@ -680,6 +825,7 @@
         void checkEmbeddedModels();
         void checkDecoderLora();
       }
+      layoutLanes();
     }
 
     function signedDb(value) {
@@ -708,7 +854,960 @@
       persistSettingsSoon();
     }
 
+    function updateSelectionLabel() {
+      const beats = Number(initial.selectionBeats) || 0;
+      const bars = beats / beatsPerBar();
+      el("selection").textContent =
+        `${initial.trackLabel} / ${beats.toFixed(2)} beats / ${bars.toFixed(2)} ${Math.abs(bars - 1) < 0.005 ? "bar" : "bars"}`;
+    }
+
+    function updateKeyUi() {
+      el("keyMode").disabled = Number(value("keyRoot")) <= 0;
+    }
+
+    // ── lora import ─────────────────────────────────────────────────────────
+    // A file picker's path would be useless here, because the sandbox can't read it. The dialog reads
+    // the file instead and hands over its bytes, which land inside the extension's own folder.
+
+    const LORA_ADAPTER = /\.(gguf|safetensors)$/i;
+    const LORA_EXTRA = /\.(json|txt)$/i;
+    let pendingPromptFiles = [];
+    let waitingForSettings = null;
+
+    function fileStem(file) {
+      return file.name.replace(/\.[^.]*$/, "");
+    }
+
+    function loraNameFromFile(file) {
+      const stem = fileStem(file);
+      const flat = /^lora-(.+?)(?:-v\d+|-f\d+)?$/i.exec(stem);
+      return flat ? flat[1] : stem;
+    }
+
+    async function uploadLoraFile(name, file) {
+      const response = await fetch(appendQuery("/api/embedded/loras/import/file", {
+        ...embeddedOptions(), name, file: file.name
+      }), { method: "POST", headers: { "X-Gary-Import": "1" }, body: file });
+      const json = await response.json();
+      if (!response.ok || !json.success) {
+        throw new Error(errorFromResponse(json, `couldn't import ${file.name}`));
+      }
+    }
+
+    async function finishLoraImport(name, adapter) {
+      const response = await fetch(appendQuery("/api/embedded/loras/import/finish", {
+        ...embeddedOptions(), name, adapter: adapter ? "1" : ""
+      }), { method: "POST", headers: { "X-Gary-Import": "1" } });
+      const json = await response.json();
+      if (!response.ok || !json.success) {
+        const error = new Error(errorFromResponse(json, `couldn't finish importing ${name}`));
+        error.needsSettings = Boolean(json.needsSettings);
+        throw error;
+      }
+      return json;
+    }
+
+    function plural(count, word) {
+      return `${count} ${word}${count === 1 ? "" : "s"}`;
+    }
+
+    async function importLoraGroup(name, files) {
+      let done = 0;
+      for (const file of files) {
+        setImportStatus(`importing ${name}: ${file.name} (${++done}/${files.length})`);
+        await uploadLoraFile(name, file);
+      }
+      setImportStatus(`checking ${name}...`);
+      let result;
+      try {
+        result = await finishLoraImport(name, files.some((file) => LORA_ADAPTER.test(file.name)));
+      } catch (error) {
+        if (error.needsSettings) waitingForSettings = { name, files };
+        throw error;
+      }
+      if (result.target !== "dit" || !result.supportsLanes) {
+        return `${name} imported, but as a ${result.target} adapter it can't run in a lane`;
+      }
+      return result.promptCount > 0
+        ? `${name} imported with ${plural(result.promptCount, "prompt")}`
+        : `${name} imported with no prompts for its dice: add a prompts.json or .txt captions with import files`;
+    }
+
+    // The adapter names the lora. Files with its name go with it, and the rest follow it when there's
+    // only one. Prompts picked alone, from wherever they're kept, go to the lora they're named after.
+    async function importLoraFiles(fileList) {
+      const files = Array.from(fileList);
+      const adapters = files.filter((file) => LORA_ADAPTER.test(file.name));
+      const extras = files.filter((file) => LORA_EXTRA.test(file.name));
+      const skipped = files.length - adapters.length - extras.length;
+      closeImportRow();
+      closeSettingsRow();
+      if (adapters.length + extras.length === 0) {
+        setImportStatus("choose a .gguf or .safetensors file, with any .json or .txt files that go with it");
+        return;
+      }
+
+      const groups = new Map();
+      const add = (name, file) => groups.set(name, (groups.get(name) || []).concat(file));
+      for (const adapter of adapters) add(loraNameFromFile(adapter), adapter);
+      const unplaced = [];
+      for (const extra of extras) {
+        const name = loraNameFromFile(extra);
+        if (groups.has(name) || (adapters.length === 0 && availableLoras.includes(name))) add(name, extra);
+        else if (adapters.length === 1) add(loraNameFromFile(adapters[0]), extra);
+        else unplaced.push(extra);
+      }
+
+      el("loraImport").disabled = true;
+      try {
+        const messages = [];
+        for (const [name, group] of groups) messages.push(await importLoraGroup(name, group));
+        await refreshLorasInPlace();
+        if (unplaced.length > 0) {
+          openImportRow(unplaced);
+          messages.push(`which lora do ${plural(unplaced.length, "file")} belong to?`);
+        }
+        if (skipped > 0) messages.push(`skipped ${plural(skipped, "other file")}`);
+        setImportStatus(messages.join("; "));
+      } catch (error) {
+        setImportStatus(error instanceof Error ? error.message : "import failed", true);
+        el("settingsRow").hidden = !waitingForSettings;
+      } finally {
+        el("loraImport").disabled = false;
+      }
+    }
+
+    // A folder is taken as one lora, named after it, like the folders in the loras folder. Only what's
+    // directly inside counts, so a training dataset's audio and subfolders never get read.
+    async function importLoraFolder(fileList) {
+      const files = Array.from(fileList);
+      closeImportRow();
+      closeSettingsRow();
+      const folder = files.length > 0 ? files[0].webkitRelativePath.split("/")[0] : "";
+      const inside = files.filter((file) => file.webkitRelativePath.split("/").length === 2);
+      const adapters = inside.filter((file) => LORA_ADAPTER.test(file.name));
+      if (!folder || adapters.length === 0) {
+        setImportStatus(`${folder || "that folder"} has no .gguf or .safetensors file directly inside it`, true);
+        return;
+      }
+      // A training run can leave several checkpoints behind. The one named after the folder is the
+      // lora, or failing that the first, and the others would only sit there unused.
+      const exact = adapters.filter((file) => fileStem(file) === folder);
+      const keep = exact.length > 0 ? exact : [adapters[0]];
+      // Oversized JSON is dataset metadata, not settings or prompts.
+      const extras = inside.filter((file) => LORA_EXTRA.test(file.name)
+        && !(file.name.toLowerCase().endsWith(".json") && file.size > 16 * 1024 * 1024));
+      const skippedAdapters = adapters.length - keep.length;
+
+      el("loraImport").disabled = true;
+      el("loraImportFolder").disabled = true;
+      try {
+        let message = await importLoraGroup(folder, keep.concat(extras));
+        await refreshLorasInPlace();
+        if (skippedAdapters > 0) message += `; left out ${plural(skippedAdapters, "other adapter")}`;
+        setImportStatus(message);
+      } catch (error) {
+        setImportStatus(error instanceof Error ? error.message : "import failed", true);
+        el("settingsRow").hidden = !waitingForSettings;
+      } finally {
+        el("loraImport").disabled = false;
+        el("loraImportFolder").disabled = false;
+      }
+    }
+
+    function closeSettingsRow() {
+      waitingForSettings = null;
+      el("settingsRow").hidden = true;
+    }
+
+    // The picker only hands over what was chosen, so a settings file left behind has to be asked for.
+    // It's saved under the adapter's name, which is how the conversion finds it.
+    function addSettingsFile(picked) {
+      if (!waitingForSettings || !picked) return;
+      const { name, files } = waitingForSettings;
+      const adapter = files.find((file) => LORA_ADAPTER.test(file.name));
+      const settings = new File([picked], `${adapter ? fileStem(adapter) : name}.json`);
+      // By the name it started under, since a folder's lora needn't be named after its adapter. With no
+      // adapter in hand, its file was already in the folder.
+      closeSettingsRow();
+      const group = files.filter((file) => file.name !== settings.name).concat(settings);
+      void importLoraGroup(name, group).then(async (message) => {
+        await refreshLorasInPlace();
+        setImportStatus(message);
+      }, (error) => {
+        setImportStatus(error instanceof Error ? error.message : "import failed", true);
+        el("settingsRow").hidden = !waitingForSettings;
+      });
+    }
+
+    function openImportRow(files) {
+      pendingPromptFiles = files;
+      const select = el("importTarget");
+      select.replaceChildren(...availableLoras.map((name) => {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        return option;
+      }));
+      el("importCount").textContent = `add ${plural(files.length, "file")} to`;
+      el("importRow").hidden = false;
+    }
+
+    function closeImportRow() {
+      pendingPromptFiles = [];
+      el("importRow").hidden = true;
+    }
+
+    async function addPendingPromptFiles() {
+      const name = value("importTarget");
+      const files = pendingPromptFiles;
+      closeImportRow();
+      if (!name || files.length === 0) return;
+      try {
+        setImportStatus(await importLoraGroup(name, files));
+      } catch (error) {
+        setImportStatus(error instanceof Error ? error.message : "import failed", true);
+      }
+    }
+
+    function wireLoraImport() {
+      const input = el("loraImportFile");
+      el("loraImport").addEventListener("click", () => input.click());
+      const folderInput = el("loraImportFolderInput");
+      el("loraImportFolder").addEventListener("click", () => folderInput.click());
+      folderInput.addEventListener("change", () => {
+        const files = Array.from(folderInput.files);
+        folderInput.value = "";
+        if (files.length > 0) void importLoraFolder(files);
+      });
+      input.addEventListener("change", () => {
+        const files = Array.from(input.files);
+        input.value = "";
+        if (files.length > 0) void importLoraFiles(files);
+      });
+      const settings = el("loraSettingsFile");
+      el("settingsChoose").addEventListener("click", () => settings.click());
+      settings.addEventListener("change", () => {
+        const picked = settings.files[0];
+        settings.value = "";
+        addSettingsFile(picked);
+      });
+      el("settingsCancel").addEventListener("click", () => {
+        closeSettingsRow();
+        setImportStatus("");
+      });
+      el("importAdd").addEventListener("click", () => void addPendingPromptFiles());
+      el("importCancel").addEventListener("click", closeImportRow);
+      // Dropping files works too, in case a host's web view won't open a picker.
+      document.addEventListener("dragover", (event) => event.preventDefault());
+      document.addEventListener("drop", (event) => {
+        event.preventDefault();
+        if (event.dataTransfer && event.dataTransfer.files.length > 0) {
+          void importLoraFiles(event.dataTransfer.files);
+        }
+      });
+    }
+
+    // ── prompts ─────────────────────────────────────────────────────────────
+    // A box shows one line. Clicking opens the whole text as a wrapped overlay, which closes again when
+    // you click away, so a long prompt never takes up room while you aren't editing it.
+
+    let overlayCommit = null;
+
+    function promptOverlayOpen() {
+      return overlayCommit !== null;
+    }
+
+    function closePromptOverlay(commit) {
+      if (!overlayCommit) return;
+      const finish = overlayCommit;
+      overlayCommit = null;
+      const overlay = el("promptOverlay");
+      overlay.style.display = "none";
+      if (commit) finish(overlay.value.trim());
+    }
+
+    function sizePromptOverlay(rect) {
+      const overlay = el("promptOverlay");
+      const margin = 8;
+      overlay.style.height = "auto";
+      const height = Math.min(Math.max(60, overlay.scrollHeight + 2), window.innerHeight - margin * 2);
+      overlay.style.height = `${height}px`;
+      overlay.style.top = `${Math.max(margin, Math.min(rect.top, window.innerHeight - height - margin))}px`;
+    }
+
+    function openPromptOverlay(rect, text, placeholder, commit) {
+      closePromptOverlay(true);
+      const overlay = el("promptOverlay");
+      overlayCommit = commit;
+      overlay.value = text;
+      overlay.placeholder = placeholder || "";
+      overlay.style.display = "block";
+      overlay.style.left = `${rect.left}px`;
+      overlay.style.width = `${rect.width}px`;
+      sizePromptOverlay(rect);
+      overlay.oninput = () => sizePromptOverlay(rect);
+      overlay.focus();
+      overlay.setSelectionRange(overlay.value.length, overlay.value.length);
+    }
+
+    function renderPromptBoxes() {
+      el("promptBox").textContent = basePrompt;
+      el("promptBox").title = basePrompt;
+      el("negativeBox").textContent = negativePrompt;
+      el("negativeBox").title = negativePrompt;
+    }
+
+    function attachPromptBox(box, read, write) {
+      const open = () => {
+        const rect = box.getBoundingClientRect();
+        openPromptOverlay(rect, read(), box.dataset.placeholder, (text) => {
+          write(text);
+          renderPromptBoxes();
+          persistSettingsSoon();
+          box.focus();
+        });
+      };
+      box.addEventListener("click", open);
+      box.addEventListener("keydown", (event) => {
+        // Typing into the box starts editing, with the key landing in the overlay.
+        if (event.key === "Enter" && !event.ctrlKey && !event.metaKey) {
+          event.preventDefault();
+          open();
+        } else if (event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+          open();
+        }
+      });
+    }
+
+    function wirePromptOverlay() {
+      const overlay = el("promptOverlay");
+      overlay.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          closePromptOverlay(true);
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          closePromptOverlay(false);
+        }
+      });
+      overlay.addEventListener("blur", () => closePromptOverlay(true));
+    }
+
+    // ── automation lanes ────────────────────────────────────────────────────
+    // Geometry, gestures and snap follow SA3LaneEditor.h in the iPlug2 demo. A point's position runs
+    // 0..1 across the range and its amount is the LoRA's strength, 0..2. Live doesn't expose its
+    // transport, so unlike REAPER there is no playback cursor here.
+
+    const MAX_LANES = 8;
+    const MAX_LANE_POINTS = 256;
+    const MAX_LANE_AMOUNT = 2;
+    const LANE_PAD = 14;
+    const LANE_CURVE_PAD = 5;
+    const LANE_COLORS = ["#e2a03b", "#4fb3d9", "#b07be0", "#6cc58b", "#e5677f", "#d6d65a", "#5f8ff0", "#e08a5c"];
+
+    let automationOn = Boolean(initial.automationOn);
+    let laneBlend = initial.laneBlend === "distinct" ? "distinct" : "one-song";
+    let laneSnap = Number(initial.laneSnap) || 0;
+    let lanes = Array.isArray(initial.lanes) ? initial.lanes : [];
+    const laneViews = [];
+
+    function laneMissing(lane) {
+      return !availableLoras.includes(lane.name);
+    }
+
+    function laneStrength(name) {
+      return currentLoraStrengths().get(name) || 0;
+    }
+
+    function laneTempo() {
+      return Number(initial.tempo) > 0 ? Number(initial.tempo) : 120;
+    }
+
+    // What the curves span: the added part for Continue, the selection otherwise.
+    function laneSeconds() {
+      const beats = operation() === "continue"
+        ? continueBarsToBeats(Number(value("continueBars")) || 0)
+        : Number(initial.selectionBeats) || 0;
+      return (beats * 60) / laneTempo();
+    }
+
+    // Every LoRA on the list gets a lane, starting flat at its slider so nothing changes until you
+    // draw. A lane whose LoRA has gone stays, so a set of curves survives a switch of model family.
+    function syncLanes() {
+      const previous = lanes;
+      const synced = [];
+      let unsupported = "";
+      for (const name of availableLoras) {
+        const existing = previous.find((lane) => lane.name === name);
+        if (existing) {
+          synced.push(existing);
+        } else if (synced.length < MAX_LANES) {
+          if (laneSupport[name] === false) {
+            unsupported = name;
+          } else {
+            const strength = laneStrength(name);
+            synced.push({ name, prompt: "", points: [[0, strength], [1, strength]] });
+          }
+        }
+      }
+      for (const lane of previous) {
+        if (!availableLoras.includes(lane.name) && synced.length < MAX_LANES) {
+          synced.push(lane);
+        }
+      }
+      lanes = synced;
+      if (unsupported) {
+        setStatus(`${unsupported} can't run in a lane, so it stays at its fixed strength`);
+      }
+    }
+
+    async function toggleAutomation() {
+      closePromptOverlay(true);
+      automationOn = !automationOn;
+      if (automationOn) syncLanes();
+      await closeAfterPersist("reopen");
+    }
+
+    function setLaneBlend(blend) {
+      laneBlend = blend;
+      updateLaneBar();
+      persistSettingsSoon();
+    }
+
+    function updateLaneBar() {
+      el("automationToggle").classList.toggle("toggle-on", automationOn);
+      el("lanePanel").hidden = !automationOn;
+      el("laneBlendOne").classList.toggle("toggle-on", laneBlend === "one-song");
+      el("laneBlendDistinct").classList.toggle("toggle-on", laneBlend === "distinct");
+      el("laneSnap").value = String(laneSnap);
+      const seconds = laneSeconds();
+      el("laneRange").textContent = seconds > 0 ? `${seconds.toFixed(2)} s` : "set a range";
+    }
+
+    function updateTimeline() {
+      updateLaneBar();
+      drawAllLanes();
+    }
+
+    function laneXAt(width, position) {
+      return LANE_PAD + position * (width - 2 * LANE_PAD);
+    }
+
+    function laneYAt(height, amount) {
+      return height - LANE_CURVE_PAD - (amount / MAX_LANE_AMOUNT) * (height - 2 * LANE_CURVE_PAD);
+    }
+
+    function lanePositionAt(width, x) {
+      return Math.min(1, Math.max(0, (x - LANE_PAD) / Math.max(1, width - 2 * LANE_PAD)));
+    }
+
+    function laneAmountAt(height, y) {
+      return Math.min(1, Math.max(0, (height - LANE_CURVE_PAD - y) / Math.max(1, height - 2 * LANE_CURVE_PAD))) * MAX_LANE_AMOUNT;
+    }
+
+    function snapDivisionSeconds() {
+      const beat = 60 / laneTempo();
+      if (laneSnap === 1) return beat;
+      if (laneSnap === 2) return beat * 2;
+      if (laneSnap === 3) return beat * beatsPerBar();
+      return 0;
+    }
+
+    // Points land on the chosen division, and freehand strokes stay free. Ctrl steps the other way:
+    // free of the division while one is chosen, and onto the beat while none is.
+    function snapLanePoint(position, amount, event, freehand) {
+      const seconds = laneSeconds();
+      const division = snapDivisionSeconds();
+      let step = 0;
+      if (event.ctrlKey || event.metaKey) {
+        if (division <= 0) {
+          const beat = 60 / laneTempo();
+          step = seconds > 0 ? beat / seconds : 1 / 16;
+        }
+        amount = Math.round(amount / 0.05) * 0.05;
+      } else if (!freehand && seconds > 0) {
+        step = division / seconds;
+      }
+      if (step > 0) {
+        const snapped = Math.min(1, Math.round(position / step) * step);
+        // The range rarely ends on the grid, but its end stays reachable.
+        position = 1 - position < Math.abs(position - snapped) ? 1 : snapped;
+      }
+      return [position, Math.min(MAX_LANE_AMOUNT, amount)];
+    }
+
+    function prepareCanvas(canvas) {
+      const ratio = window.devicePixelRatio || 1;
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      const pixelWidth = Math.max(1, Math.round(width * ratio));
+      const pixelHeight = Math.max(1, Math.round(height * ratio));
+      if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+        canvas.width = pixelWidth;
+        canvas.height = pixelHeight;
+      }
+      const g = canvas.getContext("2d");
+      g.setTransform(ratio, 0, 0, ratio, 0, 0);
+      g.clearRect(0, 0, width, height);
+      return { g, width, height };
+    }
+
+    function drawLaneGrid(g, width, height, labels) {
+      const seconds = laneSeconds();
+      if (seconds <= 0) return;
+      const inner = width - 2 * LANE_PAD;
+      const beat = 60 / laneTempo();
+      const bar = beat * beatsPerBar();
+      const barWidth = (bar / seconds) * inner;
+      const beatWidth = (beat / seconds) * inner;
+      g.lineWidth = 1;
+      if (beatWidth >= 14) {
+        g.strokeStyle = "#181818";
+        for (let t = beat; t < seconds; t += beat) {
+          const x = Math.round(laneXAt(width, t / seconds)) + 0.5;
+          g.beginPath();
+          g.moveTo(x, 0);
+          g.lineTo(x, height);
+          g.stroke();
+        }
+      }
+      const every = Math.max(1, Math.ceil(28 / Math.max(1, barWidth)));
+      g.font = "10px Arial, sans-serif";
+      g.textBaseline = "top";
+      g.textAlign = "left";
+      let index = 0;
+      for (let t = 0; t < seconds; t += bar, index++) {
+        if (index % every !== 0) continue;
+        const x = Math.round(laneXAt(width, t / seconds)) + 0.5;
+        g.strokeStyle = "#343434";
+        g.beginPath();
+        g.moveTo(x, 0);
+        g.lineTo(x, height);
+        g.stroke();
+        if (labels) {
+          g.fillStyle = "#7a7a7a";
+          g.fillText(String(index + 1), x + 3, 2);
+        }
+      }
+    }
+
+    function traceLaneCurve(g, width, height, points) {
+      g.beginPath();
+      g.moveTo(LANE_PAD, laneYAt(height, points[0][1]));
+      for (const [position, amount] of points) {
+        g.lineTo(laneXAt(width, position), laneYAt(height, amount));
+      }
+      g.lineTo(width - LANE_PAD, laneYAt(height, points[points.length - 1][1]));
+    }
+
+    // The last render only lines up with the curves if it was as long as the range is now.
+    function lastRenderFits() {
+      const last = initial.lastRender;
+      const seconds = laneSeconds();
+      return Boolean(last && Array.isArray(last.peaks) && last.peaks.length >= 2 && seconds > 0
+        && Math.abs(last.seconds - seconds) <= seconds * 0.01);
+    }
+
+    function drawLaneTake() {
+      const canvas = el("laneTake");
+      if (!automationOn || !canvas.clientWidth) return;
+      const { g, width, height } = prepareCanvas(canvas);
+      g.fillStyle = "#0c0c0c";
+      g.fillRect(0, 0, width, height);
+      drawLaneGrid(g, width, height, true);
+
+      const fits = lastRenderFits();
+      el("laneTakeLabel").textContent = fits ? "last render" : "no render at this length yet";
+      if (fits) {
+        const peaks = initial.lastRender.peaks;
+        const columns = Math.floor(peaks.length / 2);
+        const inner = width - 2 * LANE_PAD;
+        const steps = Math.min(columns, Math.floor(inner));
+        const middle = height / 2;
+        const scale = height * 0.46;
+        g.strokeStyle = "#505050";
+        g.lineWidth = 1;
+        g.beginPath();
+        for (let i = 0; i < steps; i++) {
+          const column = Math.floor((i * columns) / steps);
+          const x = LANE_PAD + (inner * i) / steps;
+          g.moveTo(x, middle - peaks[column * 2 + 1] * scale);
+          g.lineTo(x, middle - peaks[column * 2] * scale + 0.5);
+        }
+        g.stroke();
+      }
+
+      lanes.forEach((lane, index) => {
+        if (lane.points.length === 0 || laneMissing(lane)) return;
+        traceLaneCurve(g, width, height, lane.points);
+        g.strokeStyle = LANE_COLORS[index % LANE_COLORS.length];
+        g.lineWidth = 1.5;
+        g.stroke();
+      });
+    }
+
+    function hexAlpha(hex, alpha) {
+      const value = parseInt(hex.slice(1), 16);
+      return `rgba(${value >> 16}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`;
+    }
+
+    function drawLane(view) {
+      const { canvas, lane, index } = view;
+      if (!canvas.clientWidth || !canvas.clientHeight) return;
+      const { g, width, height } = prepareCanvas(canvas);
+      const missing = laneMissing(lane);
+      const color = missing ? "#7a7a7a" : LANE_COLORS[index % LANE_COLORS.length];
+      g.fillStyle = "#0c0c0c";
+      g.fillRect(0, 0, width, height);
+      drawLaneGrid(g, width, height, false);
+
+      const unity = Math.round(laneYAt(height, 1)) + 0.5;
+      g.strokeStyle = "#3c3c3c";
+      g.lineWidth = 1;
+      g.beginPath();
+      g.moveTo(0, unity);
+      g.lineTo(width, unity);
+      g.stroke();
+      g.fillStyle = "#7a7a7a";
+      g.font = "9px Arial, sans-serif";
+      g.textAlign = "left";
+      g.textBaseline = "top";
+      g.fillText("2", 3, 1);
+      g.textBaseline = "bottom";
+      g.fillText("1", 3, unity);
+      g.fillText("0", 3, height - 1);
+
+      if (lane.points.length > 0) {
+        traceLaneCurve(g, width, height, lane.points);
+        g.lineTo(width - LANE_PAD, height - LANE_CURVE_PAD);
+        g.lineTo(LANE_PAD, height - LANE_CURVE_PAD);
+        g.closePath();
+        g.fillStyle = hexAlpha(color, 0.17);
+        g.fill();
+        traceLaneCurve(g, width, height, lane.points);
+        g.strokeStyle = color;
+        g.lineWidth = 2;
+        g.stroke();
+        lane.points.forEach(([position, amount], i) => {
+          const hovered = i === view.hover;
+          g.fillStyle = hovered ? "#fff" : color;
+          g.beginPath();
+          g.arc(laneXAt(width, position), laneYAt(height, amount), hovered ? 5 : 3.5, 0, Math.PI * 2);
+          g.fill();
+        });
+      }
+    }
+
+    function drawAllLanes() {
+      if (!automationOn) return;
+      drawLaneTake();
+      for (const view of laneViews) drawLane(view);
+    }
+
+    function showLaneTip(event, position, amount) {
+      const tip = el("laneTip");
+      const seconds = laneSeconds();
+      tip.textContent = seconds > 0
+        ? `${(position * seconds).toFixed(2)} s · ${amount.toFixed(2)}`
+        : `${(position * 100).toFixed(0)}% · ${amount.toFixed(2)}`;
+      tip.style.display = "block";
+      tip.style.left = `${Math.min(event.clientX + 10, window.innerWidth - 100)}px`;
+      tip.style.top = `${Math.max(2, event.clientY - 22)}px`;
+    }
+
+    function hideLaneTip() {
+      el("laneTip").style.display = "none";
+    }
+
+    function hitLanePoint(view, x, y) {
+      const { canvas, lane } = view;
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      return lane.points.findIndex(([position, amount]) =>
+        Math.hypot(laneXAt(width, position) - x, laneYAt(height, amount) - y) < 8);
+    }
+
+    // The stroke replaces whatever was under it, keeping a point about every tenth of a second.
+    function applyLaneStroke(lane, stroke) {
+      const byPosition = stroke.slice().sort((left, right) => left[0] - right[0]);
+      const from = byPosition[0][0];
+      const to = byPosition[byPosition.length - 1][0];
+      const merged = lane.points.filter(([position]) => position < from - 1e-6 || position > to + 1e-6);
+      const seconds = laneSeconds();
+      const spacing = seconds > 0 ? 0.1 / seconds : 0.005;
+      let lastKept = -1;
+      for (const point of byPosition) {
+        if (lastKept < 0 || point[0] - lastKept >= spacing) {
+          merged.push(point.slice());
+          lastKept = point[0];
+        }
+      }
+      if (lastKept < to) merged.push(byPosition[byPosition.length - 1].slice());
+      merged.sort((left, right) => left[0] - right[0]);
+      lane.points = merged;
+    }
+
+    function attachLaneCanvas(view) {
+      const { canvas, lane } = view;
+      let drag = null;
+      const where = (event) => {
+        const rect = canvas.getBoundingClientRect();
+        return [event.clientX - rect.left, event.clientY - rect.top];
+      };
+
+      canvas.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        closePromptOverlay(true);
+        const [x, y] = where(event);
+        const hit = hitLanePoint(view, x, y);
+        canvas.setPointerCapture(event.pointerId);
+        if (hit >= 0) {
+          drag = { kind: "point", index: hit };
+          return;
+        }
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        const [position, amount] = snapLanePoint(lanePositionAt(width, x), laneAmountAt(height, y), event, event.shiftKey);
+        if (event.shiftKey) {
+          drag = { kind: "stroke", samples: [[position, amount]] };
+          return;
+        }
+        if (lane.points.length >= MAX_LANE_POINTS) {
+          setStatus("this lane is at its point limit");
+          return;
+        }
+        let at = lane.points.findIndex((point) => point[0] > position);
+        if (at < 0) at = lane.points.length;
+        lane.points.splice(at, 0, [position, amount]);
+        drag = { kind: "point", index: at };
+        view.hover = at;
+        drawLane(view);
+        drawLaneTake();
+      });
+
+      canvas.addEventListener("pointermove", (event) => {
+        const [x, y] = where(event);
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        let [position, amount] = snapLanePoint(
+          lanePositionAt(width, x),
+          laneAmountAt(height, y),
+          event,
+          drag ? drag.kind === "stroke" : event.shiftKey,
+        );
+        if (drag && drag.kind === "point") {
+          const i = drag.index;
+          const low = i > 0 ? lane.points[i - 1][0] : 0;
+          const high = i + 1 < lane.points.length ? lane.points[i + 1][0] : 1;
+          position = Math.min(high, Math.max(low, position));
+          lane.points[i] = [position, amount];
+          view.hover = i;
+          showLaneTip(event, position, amount);
+          drawLane(view);
+          drawLaneTake();
+          return;
+        }
+        if (drag && drag.kind === "stroke") {
+          drag.samples.push([position, amount]);
+          applyLaneStroke(lane, drag.samples);
+          showLaneTip(event, position, amount);
+          drawLane(view);
+          drawLaneTake();
+          return;
+        }
+        const hit = hitLanePoint(view, x, y);
+        canvas.style.cursor = hit >= 0 ? "grab" : "crosshair";
+        if (hit >= 0) [position, amount] = lane.points[hit];
+        showLaneTip(event, position, amount);
+        if (hit !== view.hover) {
+          view.hover = hit;
+          drawLane(view);
+        }
+      });
+
+      const endDrag = () => {
+        if (!drag) return;
+        drag = null;
+        hideLaneTip();
+        persistSettingsSoon();
+      };
+      canvas.addEventListener("pointerup", endDrag);
+      canvas.addEventListener("pointercancel", endDrag);
+      canvas.addEventListener("pointerleave", () => {
+        if (drag) return;
+        hideLaneTip();
+        if (view.hover >= 0) {
+          view.hover = -1;
+          drawLane(view);
+        }
+      });
+
+      const removeHit = (event) => {
+        const [x, y] = where(event);
+        const hit = hitLanePoint(view, x, y);
+        if (hit < 0) return;
+        lane.points.splice(hit, 1);
+        view.hover = -1;
+        drag = null;
+        hideLaneTip();
+        drawLane(view);
+        drawLaneTake();
+        persistSettingsSoon();
+      };
+      canvas.addEventListener("dblclick", removeHit);
+      canvas.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        // On a Mac, ctrl-click also fires this, and there ctrl means snap rather than remove.
+        if (event.button === 2) removeHit(event);
+      });
+    }
+
+    async function rollLanePrompt(lane, promptBox) {
+      try {
+        const json = await fetchJsonWithTimeout(appendQuery("/api/prompts", {
+          ...embeddedOptions(),
+          lanePool: lane.name
+        }), 15000);
+        if (!json.success) {
+          throw new Error(errorFromResponse(json, "failed to roll prompt"));
+        }
+        if (!json.prompt) {
+          setStatus(`no prompt pool found for ${lane.name}`);
+          return;
+        }
+        lane.prompt = json.prompt;
+        renderLanePromptBox(lane, promptBox);
+        persistSettingsSoon();
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "failed to roll prompt");
+      }
+    }
+
+    function renderLanePromptBox(lane, promptBox) {
+      promptBox.textContent = lane.prompt;
+      promptBox.title = lane.prompt;
+    }
+
+    function renderLanes() {
+      const stack = el("laneStack");
+      stack.replaceChildren();
+      laneViews.length = 0;
+      updateLaneBar();
+      if (lanes.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "lane-empty";
+        empty.textContent = "add a lora to draw its strength over the range";
+        stack.append(empty);
+        drawLaneTake();
+        return;
+      }
+
+      lanes.forEach((lane, index) => {
+        const missing = laneMissing(lane);
+        const row = document.createElement("div");
+        row.className = "lane-row";
+        row.style.setProperty("--lane-color", missing ? "#7a7a7a" : LANE_COLORS[index % LANE_COLORS.length]);
+
+        const head = document.createElement("div");
+        head.className = "lane-head";
+
+        const first = document.createElement("div");
+        first.className = "lane-head-line";
+        const name = document.createElement("div");
+        name.className = "lane-name";
+        name.dataset.missing = missing ? "true" : "false";
+        name.textContent = missing ? `${lane.name} (missing)` : lane.name;
+        name.title = lane.name;
+        const action = document.createElement("button");
+        action.type = "button";
+        // Every lora has a lane, so only one whose lora has gone can be removed from here.
+        action.textContent = missing ? "x" : "↺";
+        action.title = missing ? "remove this lane" : "flatten this curve at the lora's slider";
+        action.addEventListener("click", () => {
+          if (missing) {
+            lanes.splice(index, 1);
+            renderLanes();
+          } else {
+            const strength = laneStrength(lane.name);
+            lane.points = [[0, strength], [1, strength]];
+            drawAllLanes();
+          }
+          persistSettingsSoon();
+        });
+        first.append(name, action);
+
+        const second = document.createElement("div");
+        second.className = "lane-head-line";
+        const promptBox = document.createElement("div");
+        promptBox.className = "prompt-box";
+        promptBox.tabIndex = 0;
+        promptBox.dataset.placeholder = "uses the base prompt";
+        renderLanePromptBox(lane, promptBox);
+        promptBox.addEventListener("click", () => {
+          // Wider than the box, and over whatever is beside it until the edit ends.
+          const box = promptBox.getBoundingClientRect();
+          const bounds = row.getBoundingClientRect();
+          openPromptOverlay(
+            { left: bounds.left, top: box.top, width: bounds.width },
+            lane.prompt,
+            "uses the base prompt",
+            (text) => {
+              lane.prompt = text;
+              renderLanePromptBox(lane, promptBox);
+              persistSettingsSoon();
+            },
+          );
+        });
+        const dice = document.createElement("button");
+        dice.type = "button";
+        dice.textContent = "⚄";
+        dice.title = "roll a prompt from this lora's own pool";
+        dice.addEventListener("click", () => void rollLanePrompt(lane, promptBox));
+        second.append(promptBox, dice);
+
+        head.append(first, second);
+        const canvas = document.createElement("canvas");
+        row.append(head, canvas);
+        stack.append(row);
+
+        const view = { canvas, lane, index, row, hover: -1 };
+        laneViews.push(view);
+        attachLaneCanvas(view);
+      });
+      layoutLanes();
+    }
+
+    // Lanes stop growing at a comfortable height. What's left widens the gaps between them, and the
+    // rest sits evenly above and below so a few lanes don't hang from the top of the column.
+    function layoutLanes() {
+      if (!automationOn || laneViews.length === 0) {
+        drawLaneTake();
+        return;
+      }
+      const stack = el("laneStack");
+      const available = stack.clientHeight;
+      if (available <= 0) return;
+      const minimum = 56;
+      const tallest = 140;
+      const fit = Math.max(1, Math.floor(available / minimum));
+      const visible = Math.min(fit, laneViews.length);
+      const gap = visible > 1 ? Math.min(24, Math.max(3, (available - tallest * visible) / (visible - 1))) : 3;
+      const rowHeight = Math.min((available - gap * (visible - 1)) / visible, tallest);
+      const stackHeight = rowHeight * visible + gap * (visible - 1);
+      const top = laneViews.length <= fit ? Math.floor(Math.max(0, available - stackHeight) / 2) : 0;
+      stack.style.paddingTop = `${top}px`;
+      laneViews.forEach((view, index) => {
+        view.row.style.height = `${rowHeight}px`;
+        view.row.style.marginTop = index > 0 ? `${gap}px` : "0";
+      });
+      drawAllLanes();
+    }
+
     document.addEventListener("DOMContentLoaded", () => {
+      wirePromptOverlay();
+      wireLoraImport();
       el("embeddedModelsDir").value = initial.embeddedModelsDir || (initial.embeddedModelStatus && initial.embeddedModelStatus.modelsDir) || "";
       el("embeddedLorasDir").value = initial.embeddedLorasDir || "";
       el("embeddedVariant").value = initial.embeddedVariant || (initial.embeddedModelStatus && initial.embeddedModelStatus.variant) || "medium";
@@ -726,31 +1825,41 @@
         : initial.generationEndingMode;
       const ending = document.querySelector(`input[name="endingMode"][value="${initialEndingMode === "ends-here" ? "ends-here" : "keeps-going"}"]`);
       if (ending) ending.checked = true;
-      el("prompt").value = initial.prompt;
+      el("keyRoot").value = String(initial.keyRoot);
+      el("keyMode").value = String(initial.keyMode);
+      el("keyRoot").options[0].textContent = initial.liveKeyScale ? `live: ${initial.liveKeyScale}` : "live: off";
+      el("meter").value = initial.meter || "4/4";
       el("strength").value = String(initial.strength);
       el("strengthValue").textContent = Number(initial.strength).toFixed(2);
       el("steps").value = String(initial.steps);
       el("cfgScale").value = String(initial.cfgScale);
       el("shift").value = initial.shift;
-      el("negativePrompt").value = initial.negativePrompt;
       el("seed").value = initial.seed > -1 ? String(initial.seed) : initial.lastSeed || "";
       el("useSeed").checked = Boolean(initial.useSeed);
       el("lastSeed").textContent = initial.lastSeed ? `last seed: ${initial.lastSeed}` : "last seed: none";
       el("replaceSelection").checked = Boolean(initial.replaceSelection);
       const initialContinueBeats = initial.continueBeats > 0 ? initial.continueBeats : initial.selectionBeats || beatsPerBar();
       el("continueBars").value = String(Number(continueBeatsToBars(initialContinueBeats).toFixed(2)));
-      el("selection").textContent = initial.selectionLabel;
-      el("music").textContent = [initial.tempoLabel, initial.keyScaleLabel].filter(Boolean).join(" / ");
+      el("music").textContent = `${Math.round(Number(initial.tempo) || 120)} bpm`;
       setStatus(initial.statusMessage || "");
-      renderEmbeddedModelStatus(initial.embeddedModelStatus);
+      modelStatus = initial.embeddedModelStatus || null;
+      renderEmbeddedModelStatus();
       configureForOperation();
-      setSettingsVisible(false);
+      updateSelectionLabel();
+      updateKeyUi();
       updateLoudnessUi();
 
+      renderPromptBoxes();
       renderLoras();
+      if (automationOn) {
+        syncLanes();
+        renderLanes();
+      }
+      setSettingsVisible(false);
       void checkBackendHealth();
       void checkEmbeddedModels();
       void checkDecoderLora();
+      watchLoraFolder();
 
       el("shell").addEventListener("input", persistSettingsSoon);
       el("shell").addEventListener("change", persistSettingsSoon);
@@ -759,7 +1868,8 @@
       });
       for (const id of ["embeddedModelsDir", "embeddedLorasDir", "embeddedVariant", "embeddedEncoding"]) {
         el(id).addEventListener("change", () => {
-          renderEmbeddedModelStatus(null);
+          modelStatus = null;
+          renderEmbeddedModelStatus();
           void checkEmbeddedModels();
           void checkBackendHealth();
           void refreshLorasInPlace();
@@ -798,13 +1908,36 @@
       el("settingsToggle").addEventListener("click", () => {
         setSettingsVisible(el("settingsView").hidden);
       });
-      el("useLoras").addEventListener("change", updateLoraVisibility);
+      el("automationToggle").addEventListener("click", () => void toggleAutomation());
+      el("lorasFolder").addEventListener("click", () => void revealEmbeddedFolder("loras"));
+      el("hintDownloadMedium").addEventListener("click", () => void startModelDownload("medium"));
+      el("hintDownloadSmall").addEventListener("click", () => void startModelDownload("small-music"));
+      el("hintCancel").addEventListener("click", () => void cancelModelDownload());
+      el("keyRoot").addEventListener("change", updateKeyUi);
+      el("meter").addEventListener("change", () => {
+        updateSelectionLabel();
+        updateTimeline();
+      });
+      el("continueBars").addEventListener("input", updateTimeline);
+      for (const radio of document.querySelectorAll('input[name="endingMode"]')) {
+        radio.addEventListener("change", () => {
+          setStatus(radio.value === "ends-here"
+            ? "ends here: the audio lands on an ending"
+            : "keeps going: cuts off still in full swing");
+        });
+      }
+      el("laneBlendOne").addEventListener("click", () => setLaneBlend("one-song"));
+      el("laneBlendDistinct").addEventListener("click", () => setLaneBlend("distinct"));
+      el("laneSnap").addEventListener("change", () => {
+        laneSnap = Number(value("laneSnap"));
+        persistSettingsSoon();
+      });
+      attachPromptBox(el("promptBox"), () => basePrompt, (text) => { basePrompt = text; });
+      attachPromptBox(el("negativeBox"), () => negativePrompt, (text) => { negativePrompt = text; });
+      window.addEventListener("resize", layoutLanes);
       el("useSeed").addEventListener("change", updateSeedEnabled);
       el("diceButton").addEventListener("click", () => {
         void rollDiceInPlace();
-      });
-      el("refreshLoras").addEventListener("click", () => {
-        void refreshLorasInPlace();
       });
       el("cancelButton").addEventListener("click", () => {
         void closeAfterPersist("cancel");
@@ -813,11 +1946,14 @@
         void closeAfterPersist(operation());
       });
       document.addEventListener("keydown", (event) => {
+        if (promptOverlayOpen()) return;
         if (event.key === "Escape") void closeAfterPersist("cancel");
-        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") void closeAfterPersist(operation());
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !el("actionButton").disabled) {
+          void closeAfterPersist(operation());
+        }
       });
       updateSeedEnabled();
-      el("prompt").focus();
+      el("promptBox").focus();
     });
   </script>
   <style>
@@ -847,20 +1983,271 @@
     }
 
     body {
-      min-height: 100%;
-      padding: 14px;
+      height: 100%;
+      overflow: hidden;
+      padding: 12px 14px;
     }
 
     .shell {
       display: grid;
-      gap: 10px;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 8px;
+      height: 100%;
+    }
+
+    .columns {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 12px;
+      min-height: 0;
+    }
+
+    .columns[data-split="true"] {
+      grid-template-columns: 390px minmax(0, 1fr);
+    }
+
+    .main-column {
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
+      gap: 8px;
+      min-height: 0;
+    }
+
+    .main-scroll {
+      min-height: 0;
+      overflow-y: auto;
+      padding-right: 2px;
+    }
+
+    .footer {
+      display: grid;
+      gap: 5px;
+    }
+
+    .columns[data-split="true"] .grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .columns[data-split="true"] .grid .wide,
+    .columns[data-split="true"] .grid .seed-cell {
+      grid-column: 1 / -1;
+    }
+
+    .key-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr);
+      gap: 8px;
+    }
+
+    .prompt-box {
+      height: 22px;
+      line-height: 20px;
+      padding: 0 6px;
+      border: 1px solid var(--border);
+      background: var(--control);
+      color: var(--text);
+      cursor: text;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      outline-offset: 0;
+    }
+
+    .prompt-box:focus { outline: 2px solid var(--muted); }
+    .prompt-box:empty::before {
+      content: attr(data-placeholder);
+      color: var(--muted);
+    }
+
+    #promptOverlay {
+      position: fixed;
+      z-index: 50;
+      display: none;
+      min-height: 60px;
+      padding: 5px 6px;
+      resize: none;
+      overflow-y: auto;
+      border: 1px solid var(--accent);
+      background: #141414;
+      color: #fff;
+      line-height: 1.35;
+      font: inherit;
+      outline: none;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
+    }
+
+    .lora-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      padding-top: 6px;
+      border-top: 1px solid #242424;
+    }
+
+    .lora-header .lora-title {
+      flex: 1 1 auto;
+      color: var(--text);
+    }
+
+    .import-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .import-row select {
+      flex: 1 1 auto;
+    }
+
+    button.toggle-on {
+      background: var(--accent);
+      color: var(--accent-text);
+    }
+
+    .models-hint {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .lane-panel {
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr);
+      gap: 6px;
+      min-width: 0;
+      min-height: 0;
+      padding: 6px;
+      border: 1px solid #242424;
+      background: #2b2b2b;
+    }
+
+    .lane-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .lane-bar h2 {
+      margin-right: 4px;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .segments { display: flex; }
+    .segments button { min-width: 0; padding: 0 8px; }
+    .segments button + button { border-left: 0; }
+
+    .lane-bar select {
+      width: 92px;
+    }
+
+    .lane-range {
+      flex: 1 1 auto;
+      color: var(--muted);
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .lane-take {
+      display: grid;
+      grid-template-columns: 196px minmax(0, 1fr);
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .lane-take-label { color: var(--muted); }
+
+    .lane-take canvas {
+      display: block;
+      width: 100%;
+      height: 54px;
+    }
+
+    .lane-stack {
+      position: relative;
+      min-height: 0;
+      overflow-x: hidden;
+      overflow-y: auto;
+    }
+
+    .lane-empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--muted);
+    }
+
+    .lane-row {
+      display: grid;
+      grid-template-columns: 196px minmax(0, 1fr);
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .lane-head {
+      display: grid;
+      grid-template-rows: 22px 22px;
+      align-content: start;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .lane-head-line {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 24px;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .lane-name {
+      height: 22px;
+      line-height: 20px;
+      padding: 0 5px;
+      border: 1px solid var(--lane-color);
+      background: var(--control);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .lane-name[data-missing="true"] { color: var(--muted); }
+
+    .lane-head button {
+      min-width: 0;
+      padding: 0;
+    }
+
+    .lane-row canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      cursor: crosshair;
+      touch-action: none;
+    }
+
+    .lane-tip {
+      position: fixed;
+      z-index: 40;
+      display: none;
+      padding: 1px 5px;
+      background: rgba(0, 0, 0, 0.88);
+      color: #fff;
+      font-size: 10.5px;
+      pointer-events: none;
+      white-space: nowrap;
     }
 
     [hidden] { display: none !important; }
 
     .view {
       display: grid;
-      gap: 10px;
+      gap: 8px;
     }
 
     .title-row,
@@ -881,17 +2268,25 @@
 
     .selection,
     .music,
-    .muted,
-    .status {
+    .muted {
       color: var(--muted);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
 
+    .status {
+      min-height: 15px;
+      color: var(--muted);
+      line-height: 1.3;
+      overflow-wrap: anywhere;
+    }
+
+    .status[data-state="offline"] { color: #ff7d6e; }
+
     .grid {
       display: grid;
-      grid-template-columns: 1fr 76px 76px 90px;
+      grid-template-columns: minmax(0, 1fr) 76px 76px 150px;
       gap: 8px;
     }
 
@@ -928,6 +2323,7 @@
       outline: 2px solid var(--muted);
     }
 
+    select:disabled,
     input:disabled {
       opacity: 0.62;
       color: var(--muted);
@@ -1085,29 +2481,8 @@
       white-space: nowrap;
     }
 
-    details {
-      border-top: 1px solid #242424;
-      padding-top: 8px;
-    }
-
-    summary {
-      cursor: pointer;
-      color: var(--text);
-      height: 22px;
-      list-style-position: inside;
-      user-select: none;
-    }
-
-    .advanced-grid {
-      display: grid;
-      gap: 8px;
-      padding-top: 6px;
-    }
-
     .ending-control {
-      gap: 5px;
-      padding-bottom: 8px;
-      border-bottom: 1px solid #242424;
+      gap: 4px;
     }
 
     .segmented {
@@ -1134,29 +2509,19 @@
       accent-color: var(--accent);
     }
 
-    .advanced-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      min-width: 0;
-    }
-
     .lora-rows {
       display: grid;
       gap: 5px;
-      max-height: 126px;
+      /* Five rows of 22 with their gaps; the list scrolls past that. */
+      max-height: 130px;
       overflow-y: auto;
       padding-right: 2px;
     }
 
-    .lora-rows.disabled {
-      opacity: 0.45;
-    }
-
     .lora-row {
       display: grid;
-      grid-template-columns: minmax(110px, 1fr) minmax(120px, 2fr) 42px;
+      grid-template-columns: minmax(90px, 1fr) minmax(90px, 2fr) 34px 16px;
+      grid-auto-rows: 22px;
       align-items: center;
       gap: 7px;
       min-width: 0;
@@ -1173,6 +2538,34 @@
     .lora-value {
       color: var(--muted);
       text-align: right;
+    }
+
+    .lora-remove {
+      width: 16px;
+      min-width: 0;
+      height: 16px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      padding: 0;
+    }
+
+    .lora-remove:hover { color: var(--text); }
+
+    .lora-row.asking > .lora-slider,
+    .lora-row.asking > .lora-value,
+    .lora-row.asking > .lora-remove {
+      display: none;
+    }
+
+    .lora-ask {
+      grid-column: 2 / -1;
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      color: var(--muted);
     }
 
     .buttons {
@@ -1215,6 +2608,9 @@
     <input id="embeddedModelsDir" type="hidden">
     <input id="embeddedLorasDir" type="hidden">
 
+    <div class="columns" id="columns" data-split="false">
+    <div class="main-column">
+    <div class="main-scroll">
     <section class="view" id="mainView">
       <div class="meta-row">
         <div class="selection" id="selection"></div>
@@ -1224,10 +2620,54 @@
         <label class="full">
           prompt
           <div class="prompt-row">
-            <input id="prompt" type="text" placeholder="warm shoegaze guitars">
+            <div class="prompt-box" id="promptBox" role="textbox" tabindex="0"></div>
             <button id="diceButton" type="button" title="roll prompt">dice</button>
           </div>
         </label>
+        <div class="key-row full">
+          <label>
+            key
+            <select id="keyRoot" title="live follows Live's Scale Mode">
+              <option value="-1">live</option>
+              <option value="0">none</option>
+              <option value="1">C</option>
+              <option value="2">C#</option>
+              <option value="3">D</option>
+              <option value="4">D#</option>
+              <option value="5">E</option>
+              <option value="6">F</option>
+              <option value="7">F#</option>
+              <option value="8">G</option>
+              <option value="9">G#</option>
+              <option value="10">A</option>
+              <option value="11">A#</option>
+              <option value="12">B</option>
+            </select>
+          </label>
+          <label>
+            mode
+            <select id="keyMode">
+              <option value="0">major</option>
+              <option value="1">minor</option>
+            </select>
+          </label>
+          <label>
+            meter
+            <select id="meter" title="Live doesn't tell extensions the set's meter, so bars count from this">
+              <option value="2/4">2/4</option>
+              <option value="3/4">3/4</option>
+              <option value="4/4">4/4</option>
+              <option value="5/4">5/4</option>
+              <option value="6/4">6/4</option>
+              <option value="7/4">7/4</option>
+              <option value="5/8">5/8</option>
+              <option value="6/8">6/8</option>
+              <option value="7/8">7/8</option>
+              <option value="9/8">9/8</option>
+              <option value="12/8">12/8</option>
+            </select>
+          </label>
+        </div>
         <label class="wide transform-only">
           init noise
           <div class="range-row">
@@ -1265,40 +2705,42 @@
           <input id="seed" type="number" step="1" placeholder="random">
           <div class="seed-note" id="lastSeed"></div>
         </div>
-        <label class="wide">
+        <label class="full">
           negative
-          <input id="negativePrompt" type="text" placeholder="low quality">
+          <div class="prompt-box" id="negativeBox" role="textbox" tabindex="0" data-placeholder="low quality"></div>
         </label>
         <label class="check-row full transform-only">
           <input id="replaceSelection" type="checkbox">
           replace selection
         </label>
       </div>
-      <details id="advanced">
-        <summary>advanced</summary>
-        <div class="advanced-grid">
-          <div class="ending-control generate-or-continue-only">
-            <span>ending</span>
-            <div class="segmented">
-              <label><input type="radio" name="endingMode" value="ends-here"> ends here</label>
-              <label><input type="radio" name="endingMode" value="keeps-going"> keeps going</label>
-            </div>
-            <span class="muted">“keeps going” composes 6 seconds past the clip before trimming</span>
-          </div>
-          <div class="advanced-header">
-            <label class="check-row">
-              <input id="useLoras" type="checkbox">
-              use loras
-            </label>
-            <button id="refreshLoras" type="button">refresh</button>
-          </div>
-          <div class="lora-rows" id="loraRows"></div>
+      <div class="view ending-control generate-or-continue-only">
+        <span>ending</span>
+        <div class="segmented">
+          <label><input type="radio" name="endingMode" value="ends-here"> ends here</label>
+          <label><input type="radio" name="endingMode" value="keeps-going"> keeps going</label>
         </div>
-      </details>
-      <div class="status" id="loraStatus"></div>
-      <div class="buttons">
-        <button id="cancelButton" type="button">Cancel</button>
-        <button id="actionButton" class="primary" type="button">Transform</button>
+      </div>
+      <div class="lora-header">
+        <div class="lora-title">loras</div>
+        <button id="automationToggle" type="button">automation</button>
+        <button id="loraImportFolder" type="button" title="add a lora from a folder holding its .gguf or .safetensors, its .json settings, and a prompts.json or .txt captions if it has them. the lora takes the folder's name">import folder</button>
+        <button id="loraImport" type="button" title="add a single .gguf, or prompts kept somewhere else: a pool named after a lora goes to that lora, and anything else asks which">import files</button>
+        <button id="lorasFolder" type="button" title="open where lora folders go; anything dropped in there shows up on its own">open folder</button>
+        <input id="loraImportFolderInput" type="file" webkitdirectory hidden>
+        <input id="loraImportFile" type="file" multiple accept=".gguf,.safetensors,.json,.txt" hidden>
+        <input id="loraSettingsFile" type="file" accept=".json" hidden>
+      </div>
+      <div class="lora-rows" id="loraRows"></div>
+      <div class="import-row" id="importRow" hidden>
+        <span id="importCount"></span>
+        <select id="importTarget"></select>
+        <button id="importAdd" type="button">add</button>
+        <button id="importCancel" type="button">cancel</button>
+      </div>
+      <div class="import-row" id="settingsRow" hidden>
+        <button id="settingsChoose" type="button">choose settings file</button>
+        <button id="settingsCancel" type="button">cancel</button>
       </div>
     </section>
 
@@ -1394,6 +2836,44 @@
         </div>
       </div>
     </section>
+    </div>
+    <div class="footer">
+      <div class="buttons">
+        <button id="cancelButton" type="button">Cancel</button>
+        <button id="actionButton" class="primary" type="button">Transform</button>
+      </div>
+      <div class="status" id="status"></div>
+      <div class="models-hint" id="modelsHint" hidden>
+        <button id="hintDownloadMedium" type="button">download medium</button>
+        <button id="hintDownloadSmall" type="button">download small-music</button>
+        <button id="hintCancel" type="button" hidden>cancel download</button>
+      </div>
+    </div>
+    </div>
+    <section class="lane-panel" id="lanePanel" hidden>
+      <div class="lane-bar">
+        <h2>automation</h2>
+        <div class="segments">
+          <button id="laneBlendOne" type="button" title="the arrangement forms from each lane's average, then the curves apply">one song</button>
+          <button id="laneBlendDistinct" type="button" title="sections hold apart more strongly while the structure forms">distinct</button>
+        </div>
+        <select id="laneSnap" title="what dragged points land on; ctrl steps the other way">
+          <option value="0">snap off</option>
+          <option value="1">snap 1/4</option>
+          <option value="2">snap 1/2</option>
+          <option value="3">snap 1 bar</option>
+        </select>
+        <div class="lane-range" id="laneRange"></div>
+      </div>
+      <div class="lane-take">
+        <div class="lane-take-label" id="laneTakeLabel"></div>
+        <canvas id="laneTake"></canvas>
+      </div>
+      <div class="lane-stack" id="laneStack"></div>
+    </section>
+    </div>
+    <textarea id="promptOverlay" spellcheck="false"></textarea>
+    <div class="lane-tip" id="laneTip"></div>
   </div>
 </body>
 </html>

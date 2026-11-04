@@ -26,8 +26,13 @@ import {
   embeddedDownloadStatus,
   embeddedDecoderLoraStatus,
   embeddedEffectiveDirs,
+  embeddedLaneSupport,
   embeddedModelStatus,
   embeddedSa3Diagnostics,
+  finishEmbeddedLoraImport,
+  importEmbeddedLoraFile,
+  removeEmbeddedLora,
+  LoraNeedsSettingsError,
   listEmbeddedLoras,
   runEmbeddedSa3,
   startEmbeddedDecoderLoraDownload,
@@ -36,12 +41,25 @@ import {
   type EmbeddedModelStatus,
   type EmbeddedSa3Request,
 } from "./embedded-sa3.js";
+import {
+  beatsPerBarFromMeter,
+  composePrompt,
+  keyScaleText,
+  METERS,
+  planLanes,
+  sanitizeLanes,
+  type LaneBlend,
+  type LaneState,
+} from "./lane-model.js";
 
 const API_VERSION = "1.0.0";
 const COMMAND_TRANSFORM_SELECTION = "gary.sa3.transformSelection";
 const COMMAND_CONTINUE_SELECTION = "gary.sa3.continueSelection";
 const COMMAND_GENERATE_SELECTION = "gary.sa3.generateSelection";
 const SA3_CPP_TAIL_PAD_SECONDS = 6.0;
+const DIALOG_SIZE = { width: 680, height: 600 };
+// A modal keeps the size it opened with, so turning automation on reopens it wider.
+const DIALOG_SIZE_AUTOMATION = { width: 1100, height: 660 };
 let warnedMissingStorageDirectory = false;
 let warnedSettingsWriteFailure = false;
 let inMemorySettings: TransformSettings | undefined;
@@ -76,6 +94,20 @@ interface TransformSettings {
   replaceSelection: boolean;
   continueBeats: number;
   loras: LoraSelection[];
+  keyRoot: number;
+  keyMode: number;
+  meter: string;
+  automationOn: boolean;
+  laneBlend: LaneBlend;
+  laneSnap: number;
+  lanes: LaneState[];
+  lastRender: LastRender | null;
+}
+
+/** What the strip above the lanes draws: the last render's waveform and how long it was. */
+interface LastRender {
+  peaks: number[];
+  seconds: number;
 }
 
 interface LoraSelection {
@@ -84,25 +116,24 @@ interface LoraSelection {
 }
 
 interface DialogResult {
-  action: SelectionOperation | "cancel" | "dice" | "refresh-loras";
+  action: SelectionOperation | "cancel" | "dice" | "refresh-loras" | "reopen";
   settings?: TransformSettings;
 }
 
 interface DialogInitial extends TransformSettings {
   operation: SelectionOperation;
-  selectionLabel: string;
+  trackLabel: string;
   selectionBeats: number;
-  beatsPerBar: number;
-  tempoLabel: string;
-  keyScaleLabel: string;
+  tempo: number;
+  liveKeyScale: string;
   embeddedModelStatus: EmbeddedModelStatus;
   availableLoras: string[];
+  laneSupport: Record<string, boolean>;
   statusMessage: string;
 }
 
 interface MusicContext {
   tempo: number;
-  beatsPerBar: number;
   keyScale: string;
 }
 
@@ -114,6 +145,7 @@ interface DicePromptResult {
 interface TransformResult {
   filePath: string;
   seed?: string;
+  peaks: number[];
 }
 
 const defaultSettings: TransformSettings = {
@@ -135,7 +167,7 @@ const defaultSettings: TransformSettings = {
   strength: 0.9,
   steps: 8,
   cfgScale: 1.0,
-  shift: "full",
+  shift: "logsnr",
   negativePrompt: "",
   seed: -1,
   useSeed: false,
@@ -143,6 +175,14 @@ const defaultSettings: TransformSettings = {
   replaceSelection: true,
   continueBeats: 0,
   loras: [],
+  keyRoot: -1,
+  keyMode: 0,
+  meter: "4/4",
+  automationOn: false,
+  laneBlend: "one-song",
+  laneSnap: 0,
+  lanes: [],
+  lastRender: null,
 };
 
 export function activate(activation: ActivationContext) {
@@ -242,17 +282,15 @@ async function processSelection(
       continueBeats: clamp(selectionBeats, 0.25, 1024),
     };
   }
-  let loraNames = await fetchAvailableLoras(embeddedOptionsFromSettings(settings));
-  let statusMessage = loraStatusMessage(loraNames);
-  const selectionLabel = `${tracks.length} track${tracks.length === 1 ? "" : "s"} / ${formatBeatBarDuration(selectionBeats, musicContext.beatsPerBar)}`;
+  const statusMessage = loraStatusMessage(await fetchAvailableLoras(embeddedOptionsFromSettings(settings)));
+  const trackLabel = `${tracks.length} track${tracks.length === 1 ? "" : "s"}`;
 
   const dialogResult = await runTransformDialog(context, {
     operation,
     settings,
-    selectionLabel,
+    trackLabel,
     selectionBeats,
     musicContext,
-    loraNames,
     statusMessage,
   });
 
@@ -285,6 +323,8 @@ async function processSelection(
     : operation === "continue"
       ? "submitting continuation to SA3"
       : "submitting to SA3";
+  // Read again: the list can change while the dialog is open.
+  const availableLoras = await fetchAvailableLoras(embeddedOptionsFromSettings(settings));
 
   await context.ui.withinProgressDialog(title, { progress: 0 }, async (update, signal) => {
     for (let i = 0; i < tracks.length; i++) {
@@ -307,6 +347,7 @@ async function processSelection(
         ? await submitAndDownloadGenerate(
           context,
           settings,
+          availableLoras,
           musicContext,
           beatsToSeconds(selectionBeats, musicContext.tempo),
           (text, progress) => update(`${prefix}${text}`, ((i + progress) / tracks.length) * 100),
@@ -316,6 +357,7 @@ async function processSelection(
         ? await submitAndDownloadContinue(
           context,
           settings,
+          availableLoras,
           sourceWavPath,
           musicContext,
           beatsToSeconds(selectionBeats, musicContext.tempo),
@@ -326,6 +368,7 @@ async function processSelection(
         : await submitAndDownloadTransform(
           context,
           settings,
+          availableLoras,
           sourceWavPath,
           musicContext,
           beatsToSeconds(selectionBeats, musicContext.tempo),
@@ -342,6 +385,18 @@ async function processSelection(
           ...settings,
           seed: Number.isFinite(numericSeed) ? Math.trunc(numericSeed) : -1,
           lastSeed: transformed.seed,
+        };
+      }
+      if (transformed.peaks.length > 0) {
+        settings = {
+          ...settings,
+          lastRender: {
+            peaks: transformed.peaks,
+            seconds: beatsToSeconds(
+              operation === "continue" ? settings.continueBeats : selectionBeats,
+              musicContext.tempo,
+            ),
+          },
         };
       }
 
@@ -405,28 +460,27 @@ async function runTransformDialog(
   initial: {
     operation: SelectionOperation;
     settings: TransformSettings;
-    selectionLabel: string;
+    trackLabel: string;
     selectionBeats: number;
     musicContext: MusicContext;
-    loraNames: string[];
     statusMessage: string;
   },
 ): Promise<DialogResult> {
   let settings = initial.settings;
-  let loraNames = initial.loraNames;
   let statusMessage = initial.statusMessage;
 
   while (true) {
     const result = await showTransformDialog(context, {
       ...settings,
       operation: initial.operation,
-      selectionLabel: initial.selectionLabel,
+      trackLabel: initial.trackLabel,
       selectionBeats: initial.selectionBeats,
-      beatsPerBar: initial.musicContext.beatsPerBar,
-      tempoLabel: `${Math.round(initial.musicContext.tempo)} bpm`,
-      keyScaleLabel: initial.musicContext.keyScale || "scale off",
+      tempo: initial.musicContext.tempo,
+      liveKeyScale: initial.musicContext.keyScale,
       embeddedModelStatus: embeddedModelStatus(embeddedOptionsFromSettings(settings)),
-      availableLoras: mergeLoraNames(loraNames, settings.loras.map((lora) => lora.name)),
+      // Read each time: toggling automation reopens this, and the list can have changed by then.
+      availableLoras: await fetchAvailableLoras(embeddedOptionsFromSettings(settings)),
+      laneSupport: await embeddedLaneSupport(embeddedOptionsFromSettings(settings)),
       statusMessage,
     });
 
@@ -447,9 +501,13 @@ async function runTransformDialog(
       );
     }
 
+    if (result.action === "reopen") {
+      statusMessage = loraStatusMessage(await fetchAvailableLoras(embeddedOptionsFromSettings(settings)));
+      continue;
+    }
+
     if (result.action === "refresh-loras") {
-      loraNames = await fetchAvailableLoras(embeddedOptionsFromSettings(settings));
-      statusMessage = loraStatusMessage(loraNames);
+      statusMessage = loraStatusMessage(await fetchAvailableLoras(embeddedOptionsFromSettings(settings)));
       await writeStoredSettings(
         context,
         settingsForStorage(initial.settings, settings, initial.operation),
@@ -460,8 +518,9 @@ async function runTransformDialog(
     if (result.action === "dice") {
       try {
         const dice = await fetchDicePrompt(
-          settings.loras.map((lora) => lora.name),
+          settings.automationOn ? [] : settings.loras.map((lora) => lora.name),
           embeddedOptionsFromSettings(settings),
+          true,
         );
         settings = {
           ...settings,
@@ -487,10 +546,9 @@ async function showTransformDialog(
   context: Context,
   initial: DialogInitial,
 ): Promise<DialogResult> {
-  const html = transformDialog.replace(
-    "__INITIAL_JSON__",
-    JSON.stringify(initial).replaceAll("</", "<\\/"),
-  );
+  // A replacer function, because a prompt holding "$&" would otherwise be read as a pattern.
+  const initialJson = JSON.stringify(initial).replaceAll("</", "<\\/");
+  const html = transformDialog.replace("__INITIAL_JSON__", () => initialJson);
   let storedSettings = sanitizeSettings(initial);
   const server = await startDialogServer(html, {
     onSettings: async (settings) => {
@@ -500,7 +558,8 @@ async function showTransformDialog(
   });
 
   try {
-    const result = await context.ui.showModalDialog(server.url, 680, 560);
+    const size = initial.automationOn ? DIALOG_SIZE_AUTOMATION : DIALOG_SIZE;
+    const result = await context.ui.showModalDialog(server.url, size.width, size.height);
     const dialogResult = JSON.parse(result) as DialogResult;
     if (dialogResult.settings) {
       storedSettings = settingsForStorage(storedSettings, sanitizeSettings(dialogResult.settings), initial.operation);
@@ -597,17 +656,17 @@ function errorDialogHtml(title: string, message: string, details: string): strin
 async function submitAndDownloadTransform(
   context: Context,
   settings: TransformSettings,
+  availableLoras: string[],
   sourceWavPath: string,
   musicContext: MusicContext,
   durationSeconds: number,
   update: (text: string, progress: number) => Promise<void>,
   signal: AbortSignal,
 ): Promise<TransformResult> {
-  const prompt = composePrompt(settings.prompt, musicContext);
   console.log("[gary-sa3] embedded SA3 transform selected");
   const outputPath = await outputWavPath(context, "transform", path.dirname(sourceWavPath));
   const transformed = await runEmbeddedSa3(
-    embeddedSa3Request(settings, prompt, durationSeconds, {
+    embeddedSa3Request(settings, availableLoras, musicContext, durationSeconds, 0, {
       operation: "transform",
       initPath: sourceWavPath,
       initNoiseLevel: settings.strength,
@@ -625,6 +684,7 @@ async function submitAndDownloadTransform(
 async function submitAndDownloadGenerate(
   context: Context,
   settings: TransformSettings,
+  availableLoras: string[],
   musicContext: MusicContext,
   durationSeconds: number,
   update: (text: string, progress: number) => Promise<void>,
@@ -634,13 +694,12 @@ async function submitAndDownloadGenerate(
     throw new Error("SA3 generate needs a positive selection duration.");
   }
 
-  const prompt = composePrompt(settings.prompt, musicContext);
   console.log(
     `[gary-sa3] embedded SA3 generate selected duration=${durationSeconds.toFixed(3)} steps=${settings.steps} loras=${settings.loras.length}`,
   );
   const outputPath = await outputWavPath(context, "generate");
   const generated = await runEmbeddedSa3(
-    embeddedSa3Request(settings, prompt, durationSeconds, { operation: "generate" }),
+    embeddedSa3Request(settings, availableLoras, musicContext, durationSeconds, 0, { operation: "generate" }),
     outputPath,
     update,
     signal,
@@ -654,6 +713,7 @@ async function submitAndDownloadGenerate(
 async function submitAndDownloadContinue(
   context: Context,
   settings: TransformSettings,
+  availableLoras: string[],
   sourceWavPath: string,
   musicContext: MusicContext,
   sourceDurationSeconds: number,
@@ -665,14 +725,14 @@ async function submitAndDownloadContinue(
     throw new Error("SA3 continue needs a positive continuation length.");
   }
 
-  const prompt = composePrompt(settings.prompt, musicContext);
   const totalDurationSeconds = sourceDurationSeconds + continuationSeconds;
   console.log(
     `[gary-sa3] embedded SA3 continue selected source=${sourceDurationSeconds.toFixed(3)}s add=${continuationSeconds.toFixed(3)}s total=${totalDurationSeconds.toFixed(3)}s`,
   );
   const outputPath = await outputWavPath(context, "continue", path.dirname(sourceWavPath));
   const continued = await runEmbeddedSa3(
-    embeddedSa3Request(settings, prompt, continuationSeconds, {
+    // Continue's time 0 is the start of the source, while its curves are drawn over the added part.
+    embeddedSa3Request(settings, availableLoras, musicContext, continuationSeconds, sourceDurationSeconds, {
       operation: "continue",
       initPath: sourceWavPath,
     }),
@@ -686,12 +746,29 @@ async function submitAndDownloadContinue(
   return continued;
 }
 
+function promptComposer(settings: TransformSettings, musicContext: MusicContext): (prompt: string) => string {
+  const keyScale = keyScaleText(settings.keyRoot, settings.keyMode, musicContext.keyScale);
+  return (prompt) => composePrompt(prompt, musicContext.tempo, keyScale);
+}
+
 function embeddedSa3Request(
   settings: TransformSettings,
-  prompt: string,
+  availableLoras: string[],
+  musicContext: MusicContext,
   durationSeconds: number,
+  laneStartSeconds: number,
   overrides: Partial<EmbeddedSa3Request> & Pick<EmbeddedSa3Request, "operation">,
 ): EmbeddedSa3Request {
+  const compose = promptComposer(settings, musicContext);
+  const prompt = compose(settings.prompt);
+  const plan = planLanes({
+    lanes: settings.automationOn ? settings.lanes : [],
+    loras: settings.loras,
+    availableLoras,
+    composePrompt: compose,
+    offsetSeconds: laneStartSeconds,
+    durationSeconds,
+  });
   return {
     operation: overrides.operation,
     ...embeddedOptionsFromSettings(settings),
@@ -712,10 +789,11 @@ function embeddedSa3Request(
     distShift: sa3CppDistShift(settings.shift),
     seed: settings.useSeed ? settings.seed : -1,
     keepModels: settings.keepModelsResident,
-    loras: settings.loras.map((lora) => ({
-      name: lora.name,
-      strength: lora.strength,
-    })),
+    loras: plan.loras,
+    lanes: plan.lanes,
+    laneBlend: settings.laneBlend,
+    laneFallbackStrengths: Object.fromEntries(settings.loras.map((lora) => [lora.name, lora.strength])),
+    outputPeaksFromSeconds: laneStartSeconds,
     initPath: overrides.initPath,
     initNoiseLevel: overrides.initNoiseLevel,
     encodeChunkSize: 128,
@@ -846,6 +924,40 @@ async function handleDialogRequest(
     return;
   }
 
+  if (
+    (route.path.startsWith("/api/embedded/loras/import/") || route.path === "/api/embedded/loras/remove")
+    && request.method === "POST"
+  ) {
+    // Only this dialog can send that header: a web page would be stopped by the browser's CORS check,
+    // and these routes change files, so nothing else open on this machine should be able to reach them.
+    if (request.headers["x-gary-import"] !== "1") {
+      sendJson(response, 403, { success: false, error: "forbidden" });
+      return;
+    }
+    const embeddedOptions = embeddedOptionsFromRecord(route.query);
+    const name = route.query.name ?? "";
+    if (route.path === "/api/embedded/loras/remove") {
+      sendJson(response, 200, { success: true, ...(await removeEmbeddedLora(embeddedOptions, name)) });
+    } else if (route.path === "/api/embedded/loras/import/file") {
+      await importEmbeddedLoraFile(embeddedOptions, name, route.query.file ?? "", request);
+      sendJson(response, 200, { success: true });
+    } else {
+      try {
+        sendJson(response, 200, {
+          success: true,
+          ...(await finishEmbeddedLoraImport(embeddedOptions, name, route.query.adapter === "1")),
+        });
+      } catch (error) {
+        sendJson(response, 200, {
+          success: false,
+          needsSettings: error instanceof LoraNeedsSettingsError,
+          error: errorToMessage(error),
+        });
+      }
+    }
+    return;
+  }
+
   if (route.path === "/api/embedded/models/reveal" && request.method === "POST") {
     const payload = asRecord(await readJsonBody(request));
     const directory = embeddedEffectiveDirs(embeddedOptionsFromRecord(payload)).modelsDir;
@@ -877,19 +989,36 @@ async function handleDialogRequest(
   }
 
   if (route.path === "/api/prompts") {
+    const embeddedOptions = embeddedOptionsFromRecord(route.query);
+    // A lane's dice only ever draws from its own LoRA, so an empty prompt means it has no pool.
+    if (route.query.lanePool) {
+      const dice = await fetchDicePrompt([route.query.lanePool], embeddedOptions);
+      sendJson(response, 200, {
+        success: true,
+        prompt: dice.missingLoras.length > 0 ? "" : dice.prompt,
+      });
+      return;
+    }
     const loras = route.query.lora
       ? route.query.lora.split(",").map((name) => name.trim()).filter(Boolean)
       : [];
-    const dice = await fetchDicePrompt(loras, embeddedOptionsFromRecord(route.query));
+    const dice = await fetchDicePrompt(loras, embeddedOptions, true);
     sendJson(response, 200, { success: true, ...dice });
     return;
   }
 
   if (route.path === "/api/loras") {
-    const loras = await fetchAvailableLoras(embeddedOptionsFromRecord(route.query));
+    const embeddedOptions = embeddedOptionsFromRecord(route.query);
+    const loras = await fetchAvailableLoras(embeddedOptions);
+    // The dialog watches the folder with this, and only wants the rest once something has changed.
+    if (route.query.namesOnly) {
+      sendJson(response, 200, { success: true, loras });
+      return;
+    }
     sendJson(response, 200, {
       success: true,
       loras,
+      laneSupport: await embeddedLaneSupport(embeddedOptions),
       statusMessage: loraStatusMessage(loras),
     });
     return;
@@ -965,8 +1094,9 @@ async function fetchAvailableLoras(embeddedOptions: EmbeddedModelOptions = {}): 
 async function fetchDicePrompt(
   activeLoraNames: string[],
   embeddedOptions: EmbeddedModelOptions = {},
+  includeDefaults = false,
 ): Promise<DicePromptResult> {
-  const dice = await embeddedDicePrompts(activeLoraNames, embeddedOptions);
+  const dice = await embeddedDicePrompts(activeLoraNames, embeddedOptions, includeDefaults);
   return pickDicePrompt({
     success: true,
     prompts: dice.prompts,
@@ -999,7 +1129,7 @@ function sanitizeSettings(settings: TransformSettings): TransformSettings {
     cfgScale: clamp(Number(settings.cfgScale), 0.5, 2.0),
     shift: ["full", "default", "none", "logsnr", "flux"].includes(settings.shift)
       ? settings.shift
-      : "full",
+      : "logsnr",
     negativePrompt: settings.negativePrompt.trim(),
     seed,
     useSeed: Boolean(settings.useSeed && seed >= 0),
@@ -1007,7 +1137,23 @@ function sanitizeSettings(settings: TransformSettings): TransformSettings {
     replaceSelection: Boolean(settings.replaceSelection),
     continueBeats: clamp(Number(settings.continueBeats), 0, 1024),
     loras: sanitizeLoras(settings.loras),
+    keyRoot: Math.round(clamp(Number(settings.keyRoot ?? -1), -1, 12)),
+    keyMode: Number(settings.keyMode) ? 1 : 0,
+    meter: METERS.includes(settings.meter) ? settings.meter : "4/4",
+    automationOn: Boolean(settings.automationOn),
+    laneBlend: settings.laneBlend === "distinct" ? "distinct" : "one-song",
+    laneSnap: Math.round(clamp(Number(settings.laneSnap), 0, 3)),
+    lanes: sanitizeLanes(settings.lanes),
+    lastRender: sanitizeLastRender(settings.lastRender),
   };
+}
+
+function sanitizeLastRender(lastRender: LastRender | null | undefined): LastRender | null {
+  const seconds = Number(lastRender?.seconds);
+  if (!Array.isArray(lastRender?.peaks) || !(seconds > 0) || lastRender.peaks.some((peak) => !Number.isFinite(peak))) {
+    return null;
+  }
+  return { peaks: lastRender.peaks.slice(0, 2048), seconds };
 }
 
 function settingsWithEmbeddedDefaults(context: Context, settings: TransformSettings): TransformSettings {
@@ -1194,11 +1340,7 @@ function getMusicContext(context: Context): MusicContext {
   const tempo = song.tempo || 120;
   const keyScale = song.scaleMode ? formatKeyScale(song.rootNote, song.scaleName) : "";
 
-  return {
-    tempo,
-    beatsPerBar: 4,
-    keyScale,
-  };
+  return { tempo, keyScale };
 }
 
 function formatKeyScale(rootNote: number, scaleName: string): string {
@@ -1208,21 +1350,9 @@ function formatKeyScale(rootNote: number, scaleName: string): string {
   return noteName && scale ? `${noteName} ${scale}` : "";
 }
 
-function composePrompt(prompt: string, musicContext: MusicContext): string {
-  const parts = [prompt.trim(), `${Math.round(musicContext.tempo || 120)} bpm`, musicContext.keyScale.trim()]
-    .filter(Boolean);
-  return parts.join(", ");
-}
-
 function beatsToSeconds(beats: number, tempo: number): number {
   const safeTempo = tempo > 0 ? tempo : 120;
   return (beats * 60) / safeTempo;
-}
-
-function formatBeatBarDuration(beats: number, beatsPerBar: number): string {
-  const bars = beatsPerBar > 0 ? beats / beatsPerBar : beats / 4;
-  const barLabel = Math.abs(bars - 1) < 0.005 ? "bar" : "bars";
-  return `${beats.toFixed(2)} beats / ${bars.toFixed(2)} ${barLabel}`;
 }
 
 function parseRequestUrl(rawUrl: string): { path: string; query: Record<string, string> } {
@@ -1262,10 +1392,6 @@ function loraStatusMessage(loraNames: string[]): string {
   }
 
   return `${loraNames.length} lora${loraNames.length === 1 ? "" : "s"} available`;
-}
-
-function mergeLoraNames(...groups: string[][]): string[] {
-  return uniqueStrings(groups.flat().map((name) => name.trim()).filter(Boolean));
 }
 
 function uniqueStrings(values: string[]): string[] {

@@ -2,7 +2,14 @@ import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
+import { pipeline } from "node:stream/promises";
 import { promptDefaults } from "./prompt-defaults.js";
+import {
+  laneBlendSettings,
+  waveformPeaks,
+  type LaneBlend,
+  type PlannedLane,
+} from "./lane-model.js";
 
 const VARIANT_NAMES = ["medium", "small-music", "small-sfx"];
 
@@ -35,6 +42,12 @@ export interface EmbeddedSa3Request {
   limiterCeilingDb: number;
   limiterKnee: number;
   loras: EmbeddedLora[];
+  lanes: PlannedLane[];
+  laneBlend: LaneBlend;
+  /** What a lane falls back to if its LoRA can't run in one, by LoRA name. */
+  laneFallbackStrengths: Record<string, number>;
+  /** Where the part worth showing starts in the output: Continue's output includes its source. */
+  outputPeaksFromSeconds: number;
   initPath?: string | undefined;
   initNoiseLevel?: number | undefined;
   encodeChunkSize: number;
@@ -57,6 +70,7 @@ interface EmbeddedSa3Native {
     version?: string;
     nativeDir?: string;
     reason?: string;
+    supportsLanes?: boolean;
   };
   generate(
     request: Record<string, unknown>,
@@ -64,6 +78,7 @@ interface EmbeddedSa3Native {
   ): Promise<EmbeddedSa3Result>;
   cancelGeneration(): boolean;
   convertLora(request: Record<string, unknown>): Promise<{ outputPath: string }>;
+  adapterInfo(path: string): { target: string; supportsLanes: boolean } | null;
 }
 
 export interface EmbeddedModelOptions {
@@ -114,6 +129,8 @@ export interface EmbeddedLoraInfo {
   safetensorsPath?: string | undefined;
   jsonPath?: string | undefined;
   promptFiles: string[];
+  /** Other .json files in the folder, which may hold a prompt pool. */
+  jsonFiles: string[];
 }
 
 export interface EmbeddedVariantAvailability {
@@ -122,9 +139,9 @@ export interface EmbeddedVariantAvailability {
 }
 
 let downloadState: EmbeddedDownloadStatus | undefined;
-let downloadCancelRequested = false;
+let downloadAbort = new AbortController();
 let decoderDownloadState: EmbeddedDecoderLoraStatus | undefined;
-let decoderDownloadCancelRequested = false;
+let decoderDownloadAbort = new AbortController();
 
 const DECODER_LORA_REPO = "thepatch/same-l-decoder-lora";
 const DECODER_LORA_FILENAME = "squeakfix_v3.safetensors";
@@ -157,6 +174,27 @@ export function loadEmbeddedSa3(): EmbeddedSa3Native {
     cachedNativeError = error instanceof Error ? error.message : String(error);
     throw new Error(cachedNativeError);
   }
+}
+
+function adapterSupportsLanes(path: string): boolean {
+  // Unreadable or unanswerable means let generate decide, and report it if the adapter is wrong.
+  try {
+    return loadEmbeddedSa3().adapterInfo(path)?.supportsLanes !== false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Which LoRAs can have a lane, by name. A safetensors LoRA can't be read until it's converted on first
+ * use, so it counts as yes here and the render checks it again.
+ */
+export async function embeddedLaneSupport(options: EmbeddedModelOptions = {}): Promise<Record<string, boolean>> {
+  const support: Record<string, boolean> = {};
+  for (const info of await listEmbeddedLoraInfos(options)) {
+    support[info.name] = info.ggufPath ? adapterSupportsLanes(info.ggufPath) : true;
+  }
+  return support;
 }
 
 export function embeddedSa3Diagnostics(options: EmbeddedModelOptions = {}): {
@@ -203,6 +241,8 @@ export async function listEmbeddedLoraInfos(options: EmbeddedModelOptions = {}):
   return [...infos.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
 
+const FLAT_LORA_FILE = /^lora-(.+?)(?:-v\d|-f\d+)?\.gguf$/i;
+
 async function collectLoraInfos(directory: string, infos: Map<string, EmbeddedLoraInfo>): Promise<void> {
   let entries: fsSync.Dirent[];
   try {
@@ -224,13 +264,14 @@ async function collectLoraInfos(directory: string, infos: Map<string, EmbeddedLo
       continue;
     }
 
-    const flat = /^lora-(.+?)(?:-v\d|-f\d+)?\.gguf$/i.exec(entry.name);
+    const flat = FLAT_LORA_FILE.exec(entry.name);
     const name = flat?.[1]?.trim();
     if (name && !infos.has(name.toLowerCase())) {
       infos.set(name.toLowerCase(), {
         name,
         ggufPath: path.join(directory, entry.name),
         promptFiles: [],
+        jsonFiles: [],
       });
     }
   }
@@ -281,6 +322,10 @@ async function readLoraFolder(directory: string, name: string): Promise<Embedded
       .filter((entry) => entry.toLowerCase().endsWith(".txt"))
       .sort()
       .map((entry) => path.join(directory, entry)),
+    jsonFiles: entries
+      .filter((entry) => entry.toLowerCase().endsWith(".json"))
+      .map((entry) => path.join(directory, entry))
+      .filter((file) => file !== jsonPath),
   };
 }
 
@@ -309,6 +354,7 @@ export function embeddedEffectiveDirs(options: EmbeddedModelOptions = {}): {
 export async function embeddedDicePrompts(
   activeLoraNames: string[],
   options: EmbeddedModelOptions = {},
+  includeDefaults = false,
 ): Promise<{ prompts: { dice: Record<string, string[]> }; missingLoras: string[] }> {
   const wanted = [...new Set(activeLoraNames.map((name) => name.trim()).filter(Boolean))];
   const dice: Record<string, string[]> = {};
@@ -329,7 +375,7 @@ export async function embeddedDicePrompts(
     }
   }
 
-  if (Object.keys(dice).length === 0) {
+  if (includeDefaults || Object.keys(dice).length === 0) {
     Object.assign(dice, promptDefaults.dice);
   }
 
@@ -351,7 +397,29 @@ async function readLoraPromptPool(info: EmbeddedLoraInfo): Promise<string[]> {
       // Skip unreadable prompt files.
     }
   }
+  for (const jsonFile of info.jsonFiles) {
+    try {
+      for (const prompt of promptsFromPoolJson(JSON.parse(await fs.readFile(jsonFile, "utf8")))) {
+        const cleaned = stripPromptMetadata(prompt);
+        if (cleaned) {
+          prompts.add(cleaned);
+        }
+      }
+    } catch {
+      // Not every .json here is a pool, and a broken one shouldn't stop the dice.
+    }
+  }
   return [...prompts];
+}
+
+// The strings of a pool: sa3.cpp's prompts/<lora>.json shape ({ "dice": { "<bucket>": [...] } }), or a
+// plain array. Anything else, such as an adapter's rank and alpha settings, has none.
+export function promptsFromPoolJson(json: unknown): string[] {
+  const buckets = Array.isArray(json)
+    ? [json]
+    : Object.values((json as { dice?: Record<string, unknown> } | null)?.dice ?? {});
+  return buckets.flatMap((bucket) =>
+    Array.isArray(bucket) ? bucket.filter((item): item is string => typeof item === "string") : []);
 }
 
 // Remove bpm and key/scale segments from a caption so they don't collide with the
@@ -419,6 +487,37 @@ function segmentLooksLikeKey(segment: string): boolean {
   return pos === lower.length;
 }
 
+// The file a LoRA runs from, converting safetensors on first use. Unknown names pass through, so
+// libsa3 can try its own adapters-dir resolution.
+async function resolveLoraPath(
+  name: string,
+  infos: Map<string, EmbeddedLoraInfo>,
+  update?: (text: string) => Promise<void>,
+): Promise<string> {
+  const info = infos.get(name.trim().toLowerCase());
+  if (!info) {
+    return name;
+  }
+  if (info.ggufPath && !(await ggufIsStale(info))) {
+    return info.ggufPath;
+  }
+  if (info.directory && info.safetensorsPath) {
+    await update?.(`converting lora ${info.name}`);
+    const outputPath = path.join(info.directory, `${info.name}-f32.gguf`);
+    const converted = await loadEmbeddedSa3().convertLora({
+      safetensorsPath: info.safetensorsPath,
+      ...(info.jsonPath ? { jsonPath: info.jsonPath } : {}),
+      outputPath,
+    });
+    return converted.outputPath || outputPath;
+  }
+  return info.ggufPath ?? name;
+}
+
+async function loraInfosByName(options: EmbeddedModelOptions): Promise<Map<string, EmbeddedLoraInfo>> {
+  return new Map((await listEmbeddedLoraInfos(options)).map((info) => [info.name.toLowerCase(), info]));
+}
+
 export async function resolveLorasForGeneration(
   selections: EmbeddedLora[],
   options: EmbeddedModelOptions,
@@ -429,45 +528,157 @@ export async function resolveLorasForGeneration(
     return [];
   }
 
-  const infos = new Map(
-    (await listEmbeddedLoraInfos(options)).map((info) => [info.name.toLowerCase(), info]),
-  );
-
+  const infos = await loraInfosByName(options);
   const resolved: EmbeddedLora[] = [];
   for (const lora of active) {
-    const info = infos.get(lora.name.trim().toLowerCase());
-    if (!info) {
-      // Unknown here; let libsa3 try its own adapters-dir resolution.
-      resolved.push(lora);
-      continue;
-    }
+    resolved.push({ name: await resolveLoraPath(lora.name, infos, update), strength: lora.strength });
+  }
+  return resolved;
+}
 
-    if (info.ggufPath && !(await ggufIsStale(info))) {
-      resolved.push({ name: info.ggufPath, strength: lora.strength });
-      continue;
-    }
+const IMPORTABLE_LORA_FILE = /\.(gguf|safetensors|json|txt)$/iu;
+const MAX_IMPORTED_JSON_BYTES = 16 * 1024 * 1024;
 
-    if (info.directory && info.safetensorsPath) {
-      await update?.(`converting lora ${info.name}`);
-      const outputPath = path.join(info.directory, `${info.name}-f32.gguf`);
-      const native = loadEmbeddedSa3();
-      const converted = await native.convertLora({
-        safetensorsPath: info.safetensorsPath,
-        ...(info.jsonPath ? { jsonPath: info.jsonPath } : {}),
-        outputPath,
-      });
-      resolved.push({ name: converted.outputPath || outputPath, strength: lora.strength });
-      continue;
-    }
+// The folder holding one LoRA, refusing a name that would land anywhere else.
+function importedLoraDirectory(options: EmbeddedModelOptions, name: string): string {
+  const variantDir = embeddedEffectiveDirs(options).lorasVariantDir;
+  if (!variantDir) {
+    throw new Error("the loras folder isn't available");
+  }
+  // A leading "_" or "." means a disabled folder, which would make it vanish from the list.
+  if (!name.trim() || name !== path.basename(name) || /^[_.]|[<>:"/\\|?*]/u.test(name)) {
+    throw new Error(`"${name}" can't be a lora name`);
+  }
+  return path.join(variantDir, name);
+}
 
-    if (info.ggufPath) {
-      resolved.push({ name: info.ggufPath, strength: lora.strength });
-    } else {
-      resolved.push(lora);
+/**
+ * Stores a file the dialog read for us, which is how a file from anywhere reaches the sandbox: only the
+ * dialog sees the original, and this only ever writes inside the LoRA's own folder.
+ */
+export async function importEmbeddedLoraFile(
+  options: EmbeddedModelOptions,
+  name: string,
+  fileName: string,
+  body: NodeJS.ReadableStream,
+): Promise<void> {
+  const directory = importedLoraDirectory(options, name);
+  if (fileName !== path.basename(fileName) || !IMPORTABLE_LORA_FILE.test(fileName)) {
+    throw new Error(`can't import ${fileName}: choose a .gguf, .safetensors, .json or .txt file`);
+  }
+  await fs.mkdir(directory, { recursive: true });
+
+  if (fileName.toLowerCase().endsWith(".json")) {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of body) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += bytes.length;
+      if (size > MAX_IMPORTED_JSON_BYTES) {
+        throw new Error(`${fileName} is too large to be a sidecar or a prompt pool`);
+      }
+      chunks.push(bytes);
+    }
+    const text = Buffer.concat(chunks);
+    // A pool is often called <lora>.json, which next to the adapter would read as its settings.
+    let isPool = false;
+    try {
+      isPool = promptsFromPoolJson(JSON.parse(text.toString("utf8"))).length > 0;
+    } catch {
+      throw new Error(`${fileName} isn't valid JSON`);
+    }
+    await fs.writeFile(path.join(directory, isPool ? "prompts.json" : fileName), text);
+    return;
+  }
+
+  const outputPath = path.join(directory, fileName);
+  const partPath = `${outputPath}.part`;
+  await pipeline(body, fsSync.createWriteStream(partPath));
+  await fs.rename(partPath, outputPath);
+}
+
+/** A safetensors LoRA that can't convert until it has its .json settings file. */
+export class LoraNeedsSettingsError extends Error {}
+
+/** Converts an imported LoRA now, so a bad one is reported here rather than at its first render. */
+export async function finishEmbeddedLoraImport(
+  options: EmbeddedModelOptions,
+  name: string,
+  adapterJustImported: boolean,
+): Promise<{ target: string; supportsLanes: boolean; promptCount: number }> {
+  importedLoraDirectory(options, name);
+  const infos = await loraInfosByName(options);
+  const info = infos.get(name.toLowerCase());
+  if (!info) {
+    throw new Error(`${name} has no .gguf or .safetensors file yet`);
+  }
+  const promptCount = (await readLoraPromptPool(info)).length;
+  if (!info.ggufPath && !info.safetensorsPath) {
+    return { target: "dit", supportsLanes: true, promptCount };
+  }
+  let loraPath: string;
+  try {
+    loraPath = await resolveLoraPath(name, infos);
+  } catch (error) {
+    // Otherwise a file that can't run would stay on the list. One that was already here isn't ours to
+    // remove, as when prompts are added to a folder someone copied in by hand.
+    if (adapterJustImported && info.safetensorsPath) {
+      await fs.rm(info.safetensorsPath, { force: true });
+      // Only goes if nothing else is in there.
+      await fs.rmdir(path.dirname(info.safetensorsPath)).catch(() => {});
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    if (!info.jsonPath && /lora_config|json sidecar/iu.test(reason)) {
+      throw new LoraNeedsSettingsError(`${name} needs its settings file too: choose its .json`);
+    }
+    throw new Error(`couldn't convert ${name}: ${reason}`);
+  }
+  const read = loadEmbeddedSa3().adapterInfo(loraPath);
+  return { target: read?.target ?? "dit", supportsLanes: read?.supportsLanes !== false, promptCount };
+}
+
+const LORA_OWN_FILE = /\.(gguf|safetensors|json|txt)(\.part)?$/iu;
+
+/**
+ * Deletes a LoRA from the list. The name is only looked up among what's listed, so it can't reach anywhere
+ * else, and only the kinds of file a LoRA is made of go: a dataset copied in alongside one stays, and so
+ * does its folder.
+ */
+export async function removeEmbeddedLora(
+  options: EmbeddedModelOptions,
+  name: string,
+): Promise<{ itemsLeft: number }> {
+  const info = (await loraInfosByName(options)).get(name.toLowerCase());
+  if (!info) {
+    throw new Error(`${name} isn't on the list`);
+  }
+
+  const files: string[] = [];
+  if (info.directory) {
+    for (const entry of await fs.readdir(info.directory, { withFileTypes: true })) {
+      if (entry.isFile() && LORA_OWN_FILE.test(entry.name)) {
+        files.push(path.join(info.directory, entry.name));
+      }
+    }
+  }
+  // Flat files of the same name would otherwise step up and put it straight back on the list.
+  const variantDir = embeddedEffectiveDirs(options).lorasVariantDir;
+  for (const entry of await fs.readdir(variantDir, { withFileTypes: true })) {
+    if (entry.isFile() && FLAT_LORA_FILE.exec(entry.name)?.[1]?.trim().toLowerCase() === name.toLowerCase()) {
+      files.push(path.join(variantDir, entry.name));
     }
   }
 
-  return resolved;
+  await Promise.all(files.map((file) => fs.rm(file, { force: true })));
+
+  if (!info.directory) {
+    return { itemsLeft: 0 };
+  }
+  const itemsLeft = (await fs.readdir(info.directory)).length;
+  if (itemsLeft === 0) {
+    await fs.rmdir(info.directory);
+  }
+  return { itemsLeft };
 }
 
 async function ggufIsStale(info: EmbeddedLoraInfo): Promise<boolean> {
@@ -504,7 +715,7 @@ export async function runEmbeddedSa3(
   outputPath: string,
   update: (text: string, progress: number) => Promise<void>,
   signal: AbortSignal,
-): Promise<{ filePath: string; seed?: string }> {
+): Promise<{ filePath: string; seed?: string; peaks: number[] }> {
   signal.throwIfAborted();
   const native = loadEmbeddedSa3();
   const diagnostics = native.diagnostics();
@@ -524,6 +735,28 @@ export async function runEmbeddedSa3(
     { ...request, modelsDir },
     async (text) => update(text, 0.2),
   );
+
+  const lanes: Array<{ loraPath: string; prompt: string; envelope: number[] }> = [];
+  if (request.lanes.length > 0) {
+    if (!diagnostics.supportsLanes) {
+      throw new Error("this libsa3 predates automation lanes");
+    }
+    const infos = await loraInfosByName({ ...request, modelsDir });
+    for (const lane of request.lanes) {
+      const loraPath = await resolveLoraPath(lane.name, infos, async (text) => update(text, 0.2));
+      if (adapterSupportsLanes(loraPath)) {
+        lanes.push({ loraPath, prompt: lane.prompt, envelope: lane.envelope });
+        continue;
+      }
+      // Generate would fail on it, and the dialog can't know until a safetensors LoRA is converted.
+      const strength = request.laneFallbackStrengths[lane.name] ?? 0;
+      console.warn(`[gary-sa3] ${lane.name} can't run in a lane; using its fixed strength ${strength}`);
+      if (strength > 0) {
+        loras.push({ name: loraPath, strength });
+      }
+    }
+  }
+
   const decoder = embeddedDecoderLoraStatus(request);
   if (request.decoderLoraEnabled && decoder.compatible && decoder.installed) {
     loras.push({ name: decoderLoraPaths(request).ggufPath, strength: 1 });
@@ -563,6 +796,15 @@ export async function runEmbeddedSa3(
         limiterCeilingDb: request.limiterCeilingDb,
         limiterKnee: request.limiterKnee,
         loras,
+        lanes,
+        ...(() => {
+          const blend = laneBlendSettings(request.laneBlend);
+          return {
+            laneIsolation: blend.isolation,
+            laneIsolationUntil: blend.isolationUntil,
+            laneAverageUntil: blend.averageUntil,
+          };
+        })(),
         initPath: request.initPath,
         initNoiseLevel: request.initNoiseLevel,
         encodeChunkSize: request.encodeChunkSize,
@@ -587,7 +829,11 @@ export async function runEmbeddedSa3(
   await update("writing embedded SA3 output", 0.85);
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
   await fs.writeFile(outputPath, result.wav);
-  return { filePath: outputPath, seed: result.seed };
+  return {
+    filePath: outputPath,
+    seed: result.seed,
+    peaks: waveformPeaks(result.wav, request.outputPeaksFromSeconds),
+  };
 }
 
 export function embeddedModelStatus(options: EmbeddedModelOptions = {}): EmbeddedModelStatus {
@@ -617,7 +863,7 @@ export async function startEmbeddedModelDownload(options: EmbeddedModelOptions =
   }
 
   await fs.mkdir(modelsDir, { recursive: true });
-  downloadCancelRequested = false;
+  downloadAbort = new AbortController();
   downloadState = {
     ...embeddedModelStatus({ modelsDir, variant, encoding }),
     modelsDir,
@@ -630,12 +876,16 @@ export async function startEmbeddedModelDownload(options: EmbeddedModelOptions =
     label: "starting download",
   };
 
-  void downloadModelSet(modelsDir, variant, encoding).catch((error) => {
+  const signal = downloadAbort.signal;
+  void downloadModelSet(modelsDir, variant, encoding, signal).catch((error) => {
     if (downloadState) {
-      downloadState.error = error instanceof Error ? error.message : String(error);
+      const cancelled = signal.aborted;
+      downloadState.error = cancelled
+        ? ""
+        : `${error instanceof Error ? error.message : String(error)}; download again to resume`;
       downloadState.active = false;
       downloadState.done = false;
-      downloadState.label = "download failed";
+      downloadState.label = cancelled ? "download cancelled; partial files kept, resume any time" : "download failed";
     }
   });
 
@@ -658,7 +908,7 @@ export function embeddedDownloadStatus(options: EmbeddedModelOptions = {}): Embe
 }
 
 export function cancelEmbeddedModelDownload(): EmbeddedDownloadStatus {
-  downloadCancelRequested = true;
+  downloadAbort.abort();
   if (downloadState) {
     downloadState.label = "cancelling download";
   }
@@ -691,7 +941,7 @@ export async function startEmbeddedDecoderLoraDownload(
 
   const paths = decoderLoraPaths(options);
   await fs.mkdir(paths.directory, { recursive: true });
-  decoderDownloadCancelRequested = false;
+  decoderDownloadAbort = new AbortController();
   decoderDownloadState = {
     compatible: normalizeVariant(options.variant) === "medium",
     installed: await fileExists(paths.ggufPath),
@@ -702,7 +952,7 @@ export async function startEmbeddedDecoderLoraDownload(
     label: "starting decoder download",
   };
 
-  void downloadDecoderLora(options).catch((error) => {
+  void downloadDecoderLora(options, decoderDownloadAbort.signal).catch((error) => {
     decoderDownloadState = {
       ...embeddedDecoderLoraStatus(options),
       active: false,
@@ -717,7 +967,7 @@ export async function startEmbeddedDecoderLoraDownload(
 export function cancelEmbeddedDecoderLoraDownload(
   options: EmbeddedModelOptions = {},
 ): EmbeddedDecoderLoraStatus {
-  decoderDownloadCancelRequested = true;
+  decoderDownloadAbort.abort();
   if (decoderDownloadState) {
     decoderDownloadState.label = "cancelling decoder download";
   }
@@ -746,7 +996,6 @@ function resolveEmbeddedModelsDir(preferred?: string): string | undefined {
     process.env.SA3_CPP_DIR ? path.join(process.env.SA3_CPP_DIR, "models") : undefined,
     path.resolve(process.cwd(), "..", "sa3.cpp", "models"),
     path.resolve(process.cwd(), "models"),
-    process.platform === "win32" ? "C:\\dev\\sa3.cpp\\models" : undefined,
   ]);
 }
 
@@ -866,14 +1115,17 @@ function modelMissingFiles(modelsDir: string, variant: string, encoding: string)
     .map((item) => item.what);
 }
 
-async function downloadModelSet(modelsDir: string, variant: string, encoding: string): Promise<void> {
+async function downloadModelSet(
+  modelsDir: string,
+  variant: string,
+  encoding: string,
+  signal: AbortSignal,
+): Promise<void> {
   const plan = modelPlan(variant, encoding);
   let completed = 0;
 
   for (const item of plan) {
-    if (downloadCancelRequested) {
-      throw new Error("download cancelled");
-    }
+    signal.throwIfAborted();
 
     const outputPath = path.join(modelsDir, item.filename);
     if (await fileExists(outputPath)) {
@@ -891,7 +1143,7 @@ async function downloadModelSet(modelsDir: string, variant: string, encoding: st
         (completed + fileProgress) / plan.length,
         `downloading ${item.what} ${completed + 1}/${plan.length}`,
       );
-    }, () => downloadCancelRequested);
+    }, signal);
     completed += 1;
   }
 
@@ -924,7 +1176,7 @@ function updateDownloadState(
   };
 }
 
-async function downloadDecoderLora(options: EmbeddedModelOptions): Promise<void> {
+async function downloadDecoderLora(options: EmbeddedModelOptions, signal: AbortSignal): Promise<void> {
   const paths = decoderLoraPaths(options);
   if (!(await fileExists(paths.ggufPath))) {
     if (!(await fileExists(paths.safetensorsPath))) {
@@ -938,12 +1190,10 @@ async function downloadDecoderLora(options: EmbeddedModelOptions): Promise<void>
           progress: progress * 0.9,
           label: "downloading decoder correction",
         };
-      }, () => decoderDownloadCancelRequested);
+      }, signal);
     }
 
-    if (decoderDownloadCancelRequested) {
-      throw new Error("download cancelled");
-    }
+    signal.throwIfAborted();
     decoderDownloadState = {
       ...embeddedDecoderLoraStatus(options),
       active: true,
@@ -986,41 +1236,70 @@ function decoderLoraPaths(options: EmbeddedModelOptions): {
   };
 }
 
-async function downloadFile(
+// Keeps what it has in a .part file, and picks up from there the next time.
+export async function downloadFile(
   url: string,
   outputPath: string,
   onProgress: (progress: number) => void,
-  shouldCancel: () => boolean,
+  signal: AbortSignal,
 ): Promise<void> {
   const tempPath = `${outputPath}.part`;
-  const response = await fetch(url);
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  const existing = await fs.stat(tempPath).then((stats) => stats.size, () => 0);
+  const response = await fetch(url, {
+    signal,
+    ...(existing > 0 ? { headers: { Range: `bytes=${existing}-` } } : {}),
+  });
+
+  // Asked for bytes past the end, which only happens when the .part already holds them all.
+  if (response.status === 416) {
+    await response.body?.cancel();
+    await fs.rename(tempPath, outputPath);
+    onProgress(1);
+    return;
+  }
   if (!response.ok || !response.body) {
     throw new Error(`download failed (${response.status}) ${url}`);
   }
 
-  const total = Number(response.headers.get("content-length")) || 0;
-  let received = 0;
-  await fs.mkdir(path.dirname(outputPath), { recursive: true });
-  const file = fsSync.createWriteStream(tempPath);
+  // A server that ignores the range sends the whole file with a 200, so start over.
+  const resumed = response.status === 206;
+  const length = Number(response.headers.get("content-length")) || 0;
+  const total = length > 0 ? length + (resumed ? existing : 0) : 0;
+  let received = resumed ? existing : 0;
+  const file = fsSync.createWriteStream(tempPath, { flags: resumed ? "a" : "w" });
+  let failure: Error | undefined;
+  file.on("error", (error) => {
+    failure = error;
+  });
   const reader = response.body.getReader();
 
   try {
     while (true) {
-      if (shouldCancel()) {
-        throw new Error("download cancelled");
-      }
       const { done, value } = await reader.read();
       if (done) {
         break;
       }
+      if (failure) {
+        throw failure;
+      }
       received += value.byteLength;
-      file.write(Buffer.from(value));
+      if (!file.write(Buffer.from(value))) {
+        await new Promise<void>((resolve) => file.once("drain", resolve));
+      }
       onProgress(total > 0 ? received / total : 0);
     }
   } finally {
     await new Promise<void>((resolve) => file.end(resolve));
   }
 
+  // A connection that drops early can still end the stream cleanly, and that file must not be used.
+  if (failure) {
+    throw failure;
+  }
+  if (total > 0 && received < total) {
+    throw new Error(`download stopped early (${received} of ${total} bytes)`);
+  }
   await fs.rename(tempPath, outputPath);
   onProgress(1);
 }

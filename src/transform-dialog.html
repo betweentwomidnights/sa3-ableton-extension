@@ -1174,7 +1174,10 @@
         if (event.key === "Enter" && !event.ctrlKey && !event.metaKey) {
           event.preventDefault();
           open();
-        } else if (event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        } else if (
+          (event.key.length === 1 || event.key === "Backspace" || event.key === "Delete")
+          && !event.ctrlKey && !event.metaKey && !event.altKey
+        ) {
           open();
         }
       });
@@ -2013,9 +2016,13 @@
       min-height: 0;
     }
 
+    /* The scrolling clips at its padding, so this leaves room for a 2px focus outline on the left
+       edge. The negative margin keeps the controls lined up with the header and footer. */
     .main-scroll {
       min-height: 0;
       overflow-y: auto;
+      margin-left: -2px;
+      padding-left: 2px;
       padding-right: 2px;
     }
 
@@ -2167,11 +2174,14 @@
       height: 54px;
     }
 
+    /* Room for a lane prompt's focus outline, as on .main-scroll. */
     .lane-stack {
       position: relative;
       min-height: 0;
       overflow-x: hidden;
       overflow-y: auto;
+      margin-left: -2px;
+      padding-left: 2px;
     }
 
     .lane-empty {
@@ -2301,7 +2311,9 @@
     .shell[data-operation="continue"] .transform-only { display: none; }
     .shell[data-operation="generate"] .transform-only { display: none; }
 
-    label {
+    /* .field looks like a label but holds no form control: a label passes its clicks to the first
+       control inside it, which around a prompt box would be the dice button. */
+    label, .field {
       display: grid;
       gap: 4px;
       min-width: 0;
@@ -2512,10 +2524,12 @@
     .lora-rows {
       display: grid;
       gap: 5px;
-      /* Five rows of 22 with their gaps; the list scrolls past that. */
-      max-height: 130px;
+      /* Five rows of 22 with their gaps; the list scrolls past that. The padding is room for a focus
+         outline on the first and last rows, as on .main-scroll. */
+      max-height: 134px;
       overflow-y: auto;
-      padding-right: 2px;
+      margin: -2px 0;
+      padding: 2px 2px 2px 0;
     }
 
     .lora-row {
@@ -2617,13 +2631,13 @@
         <div class="music" id="music"></div>
       </div>
       <div class="grid">
-        <label class="full">
+        <div class="field full">
           prompt
           <div class="prompt-row">
-            <div class="prompt-box" id="promptBox" role="textbox" tabindex="0"></div>
+            <div class="prompt-box" id="promptBox" role="textbox" aria-label="prompt" tabindex="0"></div>
             <button id="diceButton" type="button" title="roll prompt">dice</button>
           </div>
-        </label>
+        </div>
         <div class="key-row full">
           <label>
             key
@@ -2705,10 +2719,10 @@
           <input id="seed" type="number" step="1" placeholder="random">
           <div class="seed-note" id="lastSeed"></div>
         </div>
-        <label class="full">
+        <div class="field full">
           negative
-          <div class="prompt-box" id="negativeBox" role="textbox" tabindex="0" data-placeholder="low quality"></div>
-        </label>
+          <div class="prompt-box" id="negativeBox" role="textbox" aria-label="negative prompt" tabindex="0" data-placeholder="low quality"></div>
+        </div>
         <label class="check-row full transform-only">
           <input id="replaceSelection" type="checkbox">
           replace selection

@@ -8,6 +8,7 @@
 // then open http://localhost:47811/ for the dialog. GET /__state reports what the extension asked
 // Live to do. Everything Live itself does here is faked: its dialog windows, rendering a track's audio
 // and placing clips. Test those in Live. GARY_HARNESS_SOURCE is the WAV Transform and Continue get.
+// POST /__dismiss closes the dialog the way its window's X does.
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
@@ -104,7 +105,7 @@ const hostApi = {
       state.dialog = { url, width, height };
       closeDialog = (content) => {
         state.dialog = null;
-        state.closed.push(JSON.parse(content).action ?? content);
+        state.closed.push(content ? JSON.parse(content).action ?? content : "(window closed)");
         onResult(content);
       };
     },
@@ -215,6 +216,10 @@ http.createServer(async (request, response) => {
   } else if (request.url === "/__close") {
     const message = JSON.parse(body.toString("utf8"));
     closeDialog?.(message.params[0]);
+    sendJson(response, { closed: true });
+  } else if (request.url === "/__dismiss") {
+    // What Live does when the dialog's window is closed with its X: the result is an empty string.
+    closeDialog?.("");
     sendJson(response, { closed: true });
   } else if (request.url === "/__cancel") {
     cancelProgress?.();

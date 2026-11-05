@@ -560,6 +560,10 @@ async function showTransformDialog(
   try {
     const size = initial.automationOn ? DIALOG_SIZE_AUTOMATION : DIALOG_SIZE;
     const result = await context.ui.showModalDialog(server.url, size.width, size.height);
+    // Closing the window with its X sends back nothing, which means the same as Cancel.
+    if (!result.trim()) {
+      return { action: "cancel" };
+    }
     const dialogResult = JSON.parse(result) as DialogResult;
     if (dialogResult.settings) {
       storedSettings = settingsForStorage(storedSettings, sanitizeSettings(dialogResult.settings), initial.operation);
